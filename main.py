@@ -1,7 +1,9 @@
 import os
 import sys
+import time
+import random
 import requests
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 from collections import defaultdict
 
@@ -23,7 +25,7 @@ MAIL_FROM = os.environ.get("MAIL_FROM", "").strip()
 MAIL_TO = os.environ.get("MAIL_TO", "").strip()  # lista po przecinku
 TZ_NAME = os.environ.get("TZ", "Europe/Warsaw").strip()
 
-# Statusy zamówień — jak w Twoim kodzie
+# Statusy zamówień
 ORDER_STATUSES = [
     "new", "finished", "on_order", "packed", "ready",
     "payment_waiting", "delivery_waiting", "wait_for_dispatch"
@@ -31,6 +33,12 @@ ORDER_STATUSES = [
 
 RESULTS_LIMIT = int(os.environ.get("RESULTS_LIMIT", "100"))
 TOP_N = int(os.environ.get("TOP_N", "10"))
+
+# Bezpiecznik na wypadek zapętlenia/paginacji “nigdy nie kończy”
+MAX_PAGES = int(os.environ.get("MAX_PAGES", "2000"))
+
+# Timeouty: (connect, read)
+HTTP_TIMEOUT = (10, 60)
 
 
 def require_env(name: str, value: str) -> None:
@@ -52,10 +60,9 @@ def get_report_range(days_back: int = 1):
     now = datetime.now(tz)
     report_date = now.date() - timedelta(days=days_back)
 
-    start_dt = datetime.combine(report_date, time(0, 0, 0), tzinfo=tz)
-    end_dt = datetime.combine(report_date, time(23, 59, 59), tzinfo=tz)
+    start_dt = datetime.combine(report_date, dtime(0, 0, 0), tzinfo=tz)
+    end_dt = datetime.combine(report_date, dtime(23, 59, 59), tzinfo=tz)
 
-    # Format jak w Twoim kodzie
     start_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
     end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -63,10 +70,39 @@ def get_report_range(days_back: int = 1):
     return label, start_str, end_str
 
 
+def _post_with_retry(url: str, payload: dict, headers: dict, *, max_attempts: int = 5) -> requests.Response:
+    """
+    POST z retry na problemy sieciowe + 429 + 5xx.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=HTTP_TIMEOUT)
+        except requests.RequestException as e:
+            if attempt == max_attempts:
+                raise RuntimeError(f"Błąd sieci po {attempt} próbach: {e}") from e
+            sleep_s = (1.6 ** attempt) + random.random()
+            print(f"[IDOSELL] Błąd sieci: {e} | retry za {sleep_s:.1f}s (próba {attempt}/{max_attempts})")
+            time.sleep(sleep_s)
+            continue
+
+        if resp.status_code in (429, 500, 502, 503, 504):
+            if attempt == max_attempts:
+                return resp
+            sleep_s = (1.6 ** attempt) + random.random()
+            print(f"[IDOSELL] HTTP {resp.status_code} | retry za {sleep_s:.1f}s (próba {attempt}/{max_attempts})")
+            time.sleep(sleep_s)
+            continue
+
+        return resp
+
+    # Teoretycznie nieosiągalne
+    raise RuntimeError("Nieoczekiwany błąd w _post_with_retry")
+
+
 def fetch_orders_for_range(start_str: str, end_str: str) -> list[dict]:
     """
     Pobiera wszystkie zamówienia z IdoSell w zadanym zakresie dat, z paginacją.
-    Uwaga: IdoSell może zwrócić HTTP 207 dla pustej strony ("zwrócono pusty wynik") — traktujemy to jako koniec.
+    IdoSell może zwrócić HTTP 207 dla pustej strony ("zwrócono pusty wynik") — traktujemy to jako koniec.
     """
     headers = {
         "Content-Type": "application/json",
@@ -92,16 +128,14 @@ def fetch_orders_for_range(start_str: str, end_str: str) -> list[dict]:
 
     while True:
         page = payload["params"]["resultsPage"]
+        if page >= MAX_PAGES:
+            raise RuntimeError(f"Osiągnięto MAX_PAGES={MAX_PAGES}. Coś nie tak z paginacją / filtrem.")
+
         print(f"[IDOSELL] Pobieranie strony: {page}")
 
-        resp = requests.post(
-            IDOSELL_ENDPOINT,
-            json=payload,
-            headers=headers,
-            timeout=60
-        )
+        resp = _post_with_retry(IDOSELL_ENDPOINT, payload, headers)
 
-        # IdoSell: 207 bywa używane jako sygnał "pusto" dla kolejnej strony
+        # IdoSell: 207 = “pusto / koniec”
         if resp.status_code == 207:
             print(f"[IDOSELL] Koniec wyników (HTTP 207): {resp.text}")
             break
@@ -109,14 +143,23 @@ def fetch_orders_for_range(start_str: str, end_str: str) -> list[dict]:
         if resp.status_code != 200:
             raise RuntimeError(f"Błąd API: {resp.status_code} – {resp.text}")
 
-        data = resp.json()
-        orders = data.get("Results", [])
+        try:
+            data = resp.json()
+        except ValueError as e:
+            raise RuntimeError(f"HTTP 200, ale odpowiedź nie jest JSON. Body (pierwsze 500): {resp.text[:500]}") from e
+
+        # W Twoim kodzie było "Results" — zostawiam, ale dorzucam fallback
+        orders = data.get("Results")
+        if orders is None:
+            orders = data.get("results", [])
+
         if not orders:
-            print(f"[IDOSELL] Koniec wyników na stronie {page}.")
+            print(f"[IDOSELL] Koniec wyników na stronie {page} (pusta lista przy HTTP 200).")
             break
 
         print(f"[IDOSELL] Zamówień na stronie {page}: {len(orders)}")
         all_orders.extend(orders)
+
         payload["params"]["resultsPage"] += 1
 
     return all_orders
@@ -124,7 +167,7 @@ def fetch_orders_for_range(start_str: str, end_str: str) -> list[dict]:
 
 def detect_order_source(order: dict) -> str:
     """
-    'allegro' lub 'sklep' — jak w Twoim kodzie (auctionsServiceName).
+    'allegro' lub 'sklep' — na podstawie auctionsServiceName.
     """
     auctions_service_name = (
         order.get("orderDetails", {})
