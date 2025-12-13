@@ -66,6 +66,7 @@ def get_report_range(days_back: int = 1):
 def fetch_orders_for_range(start_str: str, end_str: str) -> list[dict]:
     """
     Pobiera wszystkie zamówienia z IdoSell w zadanym zakresie dat, z paginacją.
+    Uwaga: IdoSell może zwrócić HTTP 207 dla pustej strony ("zwrócono pusty wynik") — traktujemy to jako koniec.
     """
     headers = {
         "Content-Type": "application/json",
@@ -100,13 +101,13 @@ def fetch_orders_for_range(start_str: str, end_str: str) -> list[dict]:
             timeout=60
         )
 
+        # IdoSell: 207 bywa używane jako sygnał "pusto" dla kolejnej strony
         if resp.status_code == 207:
-    # IdoSell czasem zwraca 207 z komunikatem o pustym wyniku dla kolejnej strony
-    print(f"[IDOSELL] Koniec wyników (HTTP 207): {resp.text}")
-    break
+            print(f"[IDOSELL] Koniec wyników (HTTP 207): {resp.text}")
+            break
 
-if resp.status_code != 200:
-    raise RuntimeError(f"Błąd API: {resp.status_code} – {resp.text}")
+        if resp.status_code != 200:
+            raise RuntimeError(f"Błąd API: {resp.status_code} – {resp.text}")
 
         data = resp.json()
         orders = data.get("Results", [])
