@@ -100,8 +100,13 @@ def fetch_orders_for_range(start_str: str, end_str: str) -> list[dict]:
             timeout=60
         )
 
-        if resp.status_code != 200:
-            raise RuntimeError(f"Błąd API: {resp.status_code} – {resp.text}")
+        if resp.status_code == 207:
+    # IdoSell czasem zwraca 207 z komunikatem o pustym wyniku dla kolejnej strony
+    print(f"[IDOSELL] Koniec wyników (HTTP 207): {resp.text}")
+    break
+
+if resp.status_code != 200:
+    raise RuntimeError(f"Błąd API: {resp.status_code} – {resp.text}")
 
         data = resp.json()
         orders = data.get("Results", [])
