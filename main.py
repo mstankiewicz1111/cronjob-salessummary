@@ -186,7 +186,8 @@ def top_n_products(d: dict[str, float], n: int) -> list[tuple[str, int | float]]
 
 def aggregate_report(orders: list[dict]) -> dict:
     """
-    Zwraca metryki + top N osobno dla sklepu i Allegro.
+    Zwraca metryki + top N osobno dla sklepu i Allegro
+    oraz łączną wartość zamówień (bez podziału na źródło).
     """
     orders_sklep_ids = set()
     orders_allegro_ids = set()
@@ -195,10 +196,24 @@ def aggregate_report(orders: list[dict]) -> dict:
     product_qty_sklep = defaultdict(float)
     product_qty_allegro = defaultdict(float)
 
+    total_revenue = 0.0  # 👈 NOWE
+
     for order in orders:
         order_id = order.get("orderId")
         if order_id:
             daily_order_ids.add(order_id)
+
+        # 👇 SUMA WARTOŚCI ZAMÓWIEŃ (BRUTTO)
+        try:
+            order_total = (
+                order.get("orderDetails", {})
+                     .get("orderSummary", {})
+                     .get("orderTotalGross")
+            )
+            if order_total is not None:
+                total_revenue += float(order_total)
+        except (ValueError, TypeError):
+            pass
 
         source = detect_order_source(order)
         if order_id:
@@ -222,6 +237,7 @@ def aggregate_report(orders: list[dict]) -> dict:
                 product_qty_sklep[product_name] += qty
 
     return {
+        "total_revenue": round(total_revenue, 2),  # 👈 NOWE
         "orders_sklep_count": len(orders_sklep_ids),
         "orders_allegro_count": len(orders_allegro_ids),
         "orders_total_count": len(daily_order_ids),
@@ -269,6 +285,7 @@ def build_email_html(report_label: str, agg: dict) -> str:
 
       <h3 style="margin:16px 0 6px;">Podsumowanie</h3>
       <ul style="margin:6px 0 0 18px;">
+        <li><b>Łączna wartość zamówień:</b> <b>{agg['total_revenue']:.2f} zł</b></li>
         <li>Liczba zamówień (Sklep): <b>{agg['orders_sklep_count']}</b></li>
         <li>Liczba zamówień (Allegro): <b>{agg['orders_allegro_count']}</b></li>
         <li>Łączna liczba zamówień: <b>{agg['orders_total_count']}</b></li>
