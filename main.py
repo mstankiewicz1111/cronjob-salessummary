@@ -285,10 +285,10 @@ def build_email_html(report_label: str, agg: dict) -> str:
 
       <h3 style="margin:16px 0 6px;">Podsumowanie</h3>
       <ul style="margin:6px 0 0 18px;">
-        <li><b>Łączna wartość zamówień:</b> <b>{agg['total_revenue']:.2f} zł</b></li>
         <li>Liczba zamówień (Sklep): <b>{agg['orders_sklep_count']}</b></li>
         <li>Liczba zamówień (Allegro): <b>{agg['orders_allegro_count']}</b></li>
         <li>Łączna liczba zamówień: <b>{agg['orders_total_count']}</b></li>
+        <li><b>Łączna wartość zamówień:</b> <b>{agg['total_revenue']:.2f} zł</b></li>
       </ul>
 
       <h3 style="margin:16px 0 6px;">Top {TOP_N} sprzedanych towarów — Sklep</h3>
