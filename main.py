@@ -51,6 +51,11 @@ def fmt_qty(x: float):
     return int(x) if x == int(x) else x
 
 
+def fmt_money_pln(x: float) -> str:
+    # proste formatowanie 2 miejsca po przecinku
+    return f"{x:.2f} zł"
+
+
 def get_report_range(days_back: int = 1):
     """
     Raport za 'wczoraj' w strefie TZ_NAME.
@@ -95,7 +100,6 @@ def _post_with_retry(url: str, payload: dict, headers: dict, *, max_attempts: in
 
         return resp
 
-    # Teoretycznie nieosiągalne
     raise RuntimeError("Nieoczekiwany błąd w _post_with_retry")
 
 
@@ -148,7 +152,6 @@ def fetch_orders_for_range(start_str: str, end_str: str) -> list[dict]:
         except ValueError as e:
             raise RuntimeError(f"HTTP 200, ale odpowiedź nie jest JSON. Body (pierwsze 500): {resp.text[:500]}") from e
 
-        # W Twoim kodzie było "Results" — zostawiam, ale dorzucam fallback
         orders = data.get("Results")
         if orders is None:
             orders = data.get("results", [])
@@ -184,10 +187,42 @@ def top_n_products(d: dict[str, float], n: int) -> list[tuple[str, int | float]]
     return [(name, fmt_qty(qty)) for name, qty in items]
 
 
+def _safe_float(x) -> float:
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def extract_order_gross_value(order: dict) -> tuple[float, str]:
+    """
+    Liczy wartość zamówienia na podstawie:
+      orderDetails.payments.orderCurrency:
+        - orderProductsCost
+        - orderDeliveryCost
+        - orderPayformCost
+        - orderInsuranceCost
+
+    Zwraca: (wartość, waluta)
+    """
+    payments = order.get("orderDetails", {}).get("payments", {}) or {}
+    oc = payments.get("orderCurrency", {}) or {}
+
+    currency = str(oc.get("currencyId") or "").strip() or "PLN"
+
+    products = _safe_float(oc.get("orderProductsCost"))
+    delivery = _safe_float(oc.get("orderDeliveryCost"))
+    payform = _safe_float(oc.get("orderPayformCost"))
+    insurance = _safe_float(oc.get("orderInsuranceCost"))
+
+    total = products + delivery + payform + insurance
+    return total, currency
+
+
 def aggregate_report(orders: list[dict]) -> dict:
     """
     Zwraca metryki + top N osobno dla sklepu i Allegro
-    oraz łączną wartość zamówień (bez podziału na źródło).
+    oraz łączną wartość zamówień (brutto) wg orderCurrency.
     """
     orders_sklep_ids = set()
     orders_allegro_ids = set()
@@ -196,24 +231,23 @@ def aggregate_report(orders: list[dict]) -> dict:
     product_qty_sklep = defaultdict(float)
     product_qty_allegro = defaultdict(float)
 
-    total_revenue = 0.0  # 👈 NOWE
+    total_revenue = 0.0
+    currencies_seen = set()
+
+    # Na wszelki wypadek: nie licz dwa razy tego samego orderId
+    revenue_counted_for = set()
 
     for order in orders:
         order_id = order.get("orderId")
         if order_id:
             daily_order_ids.add(order_id)
 
-        # 👇 SUMA WARTOŚCI ZAMÓWIEŃ (BRUTTO)
-        try:
-            order_total = (
-                order.get("orderDetails", {})
-                     .get("orderSummary", {})
-                     .get("orderTotalGross")
-            )
-            if order_total is not None:
-                total_revenue += float(order_total)
-        except (ValueError, TypeError):
-            pass
+        # SUMA WARTOŚCI ZAMÓWIEŃ (BRUTTO)
+        if order_id and order_id not in revenue_counted_for:
+            order_value, currency = extract_order_gross_value(order)
+            total_revenue += order_value
+            currencies_seen.add(currency)
+            revenue_counted_for.add(order_id)
 
         source = detect_order_source(order)
         if order_id:
@@ -226,18 +260,22 @@ def aggregate_report(orders: list[dict]) -> dict:
             product_name = str(product.get("productName") or "Nieznany Produkt").strip()
             qv = product.get("productQuantity")
 
-            try:
-                qty = float(qv) if qv is not None else 0.0
-            except (ValueError, TypeError):
-                qty = 0.0
+            qty = _safe_float(qv)
 
             if source == "allegro":
                 product_qty_allegro[product_name] += qty
             else:
                 product_qty_sklep[product_name] += qty
 
+    currency_note = ""
+    if len(currencies_seen) > 1:
+        currency_note = f" (uwaga: wiele walut: {', '.join(sorted(currencies_seen))})"
+    elif len(currencies_seen) == 1 and "PLN" not in currencies_seen:
+        currency_note = f" (waluta: {next(iter(currencies_seen))})"
+
     return {
-        "total_revenue": round(total_revenue, 2),  # 👈 NOWE
+        "total_revenue": round(total_revenue, 2),
+        "currency_note": currency_note,
         "orders_sklep_count": len(orders_sklep_ids),
         "orders_allegro_count": len(orders_allegro_ids),
         "orders_total_count": len(daily_order_ids),
@@ -279,6 +317,8 @@ def render_table(rows: list[tuple[str, int | float]]) -> str:
 
 
 def build_email_html(report_label: str, agg: dict) -> str:
+    total_value_str = fmt_money_pln(agg["total_revenue"]) + agg.get("currency_note", "")
+
     return f"""
     <div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.4;">
       <h2 style="margin:0 0 10px;">Raport zamówień — {report_label}</h2>
@@ -288,7 +328,7 @@ def build_email_html(report_label: str, agg: dict) -> str:
         <li>Liczba zamówień (Sklep): <b>{agg['orders_sklep_count']}</b></li>
         <li>Liczba zamówień (Allegro): <b>{agg['orders_allegro_count']}</b></li>
         <li>Łączna liczba zamówień: <b>{agg['orders_total_count']}</b></li>
-        <li><b>Łączna wartość zamówień:</b> <b>{agg['total_revenue']:.2f} zł</b></li>
+        <li><b>Łączna wartość zamówień:</b> <b>{total_value_str}</b></li>
       </ul>
 
       <h3 style="margin:16px 0 6px;">Top {TOP_N} sprzedanych towarów — Sklep</h3>
