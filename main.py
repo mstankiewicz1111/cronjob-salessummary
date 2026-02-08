@@ -7,9 +7,6 @@ from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 from collections import defaultdict
 
-from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail
-
 
 # =========================
 # Konfiguracja (ENV)
@@ -20,7 +17,7 @@ IDOSELL_ENDPOINT = os.environ.get(
     "https://client5056.idosell.com/api/admin/v3/orders/orders/get"
 ).strip()
 
-SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "").strip()
+BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "").strip()
 MAIL_FROM = os.environ.get("MAIL_FROM", "").strip()
 MAIL_TO = os.environ.get("MAIL_TO", "").strip()  # lista po przecinku
 TZ_NAME = os.environ.get("TZ", "Europe/Warsaw").strip()
@@ -349,21 +346,32 @@ def send_email(subject: str, html: str) -> None:
     if not recipients:
         raise RuntimeError("MAIL_TO jest puste albo w złym formacie (użyj przecinków).")
 
-    message = Mail(
-        from_email=MAIL_FROM,
-        to_emails=recipients,
-        subject=subject,
-        html_content=html,
-    )
+    url = "https://api.brevo.com/v3/smtp/email"
+    headers = {
+        "accept": "application/json",
+        "api-key": BREVO_API_KEY,
+        "content-type": "application/json",
+    }
 
-    sg = SendGridAPIClient(SENDGRID_API_KEY)
-    resp = sg.send(message)
-    print(f"[SENDGRID] Status: {resp.status_code}")
+    payload = {
+        "sender": {"email": MAIL_FROM},
+        "to": [{"email": r} for r in recipients],
+        "subject": subject,
+        "htmlContent": html,
+    }
+
+    resp = requests.post(url, json=payload, headers=headers, timeout=HTTP_TIMEOUT)
+
+    # Brevo zwykle zwraca 201 Created dla poprawnej wysyłki
+    if resp.status_code not in (200, 201, 202):
+        raise RuntimeError(f"[BREVO] Błąd wysyłki: HTTP {resp.status_code} – {resp.text}")
+
+    print(f"[BREVO] Status: {resp.status_code}")
 
 
 def main():
     require_env("IDOSELL_API_KEY", IDOSELL_API_KEY)
-    require_env("SENDGRID_API_KEY", SENDGRID_API_KEY)
+    require_env("BREVO_API_KEY", BREVO_API_KEY)
     require_env("MAIL_FROM", MAIL_FROM)
     require_env("MAIL_TO", MAIL_TO)
 
