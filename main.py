@@ -521,8 +521,14 @@ def send_email(subject: str, html: str, max_attempts: int = 3) -> None:
         "content-type": "application/json",
     }
 
+    # Pobieramy nazwę z ENV, a jeśli jej nie ma, podstawiamy "WASSYL | raport sprzedaży"
+    sender_name = os.environ.get("MAIL_FROM_NAME", "WASSYL | raport sprzedaży").strip()
+
     payload = {
-        "sender": {"email": MAIL_FROM},
+        "sender": {
+            "name": sender_name,
+            "email": MAIL_FROM
+        },
         "to": [{"email": r} for r in recipients],
         "subject": subject,
         "htmlContent": html,
@@ -533,14 +539,12 @@ def send_email(subject: str, html: str, max_attempts: int = 3) -> None:
             print(f"[BREVO] Próba wysyłki maila ({attempt}/{max_attempts})...")
             resp = requests.post(url, json=payload, headers=headers, timeout=HTTP_TIMEOUT)
             
-            # Brevo zwraca zazwyczaj 201 Created
             if resp.status_code in (200, 201, 202):
                 print(f"[BREVO] Sukces! Status: {resp.status_code}")
                 return
             
             print(f"[BREVO] HTTP {resp.status_code} – {resp.text} | próba {attempt}/{max_attempts}")
             if resp.status_code not in (429, 500, 502, 503, 504):
-                # Jeśli to błąd aplikacji (np. złe tokeny - 401/400), nie ma sensu ponawiać pętli
                 raise RuntimeError(f"[BREVO] Błąd krytyczny API: HTTP {resp.status_code} – {resp.text}")
                 
         except requests.RequestException as e:
@@ -548,7 +552,6 @@ def send_email(subject: str, html: str, max_attempts: int = 3) -> None:
             if attempt == max_attempts:
                 raise RuntimeError(f"[BREVO] Nie udało się wysłać raportu po {max_attempts} próbach.") from e
         
-        # Wykładniczy czas oczekiwania (2s, 4s...) + losowy ułamek sekundy
         sleep_s = (2 ** attempt) + random.random()
         print(f"[BREVO] Ponowienie za {sleep_s:.1f}s...")
         time.sleep(sleep_s)
