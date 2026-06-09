@@ -430,7 +430,7 @@ def build_email_html(report_label: str, agg: dict, trends_3d: list, trends_7d: l
     """
 
 
-def send_email(subject: str, html: str) -> None:
+def send_email(subject: str, html: str, max_attempts: int = 3) -> None:
     recipients = [x.strip() for x in MAIL_TO.split(",") if x.strip()]
     if not recipients:
         raise RuntimeError("MAIL_TO jest puste albo w złym formacie.")
@@ -449,11 +449,30 @@ def send_email(subject: str, html: str) -> None:
         "htmlContent": html,
     }
 
-    resp = requests.post(url, json=payload, headers=headers, timeout=HTTP_TIMEOUT)
-    if resp.status_code not in (200, 201, 202):
-        raise RuntimeError(f"[BREVO] Błąd wysyłki: HTTP {resp.status_code} – {resp.text}")
-
-    print(f"[BREVO] Status: {resp.status_code}")
+    for attempt in range(1, max_attempts + 1):
+        try:
+            print(f"[BREVO] Próba wysyłki maila ({attempt}/{max_attempts})...")
+            resp = requests.post(url, json=payload, headers=headers, timeout=HTTP_TIMEOUT)
+            
+            # Brevo zwraca zazwyczaj 201 Created
+            if resp.status_code in (200, 201, 202):
+                print(f"[BREVO] Sukces! Status: {resp.status_code}")
+                return
+            
+            print(f"[BREVO] HTTP {resp.status_code} – {resp.text} | próba {attempt}/{max_attempts}")
+            if resp.status_code not in (429, 500, 502, 503, 504):
+                # Jeśli to błąd aplikacji (np. złe tokeny - 401/400), nie ma sensu ponawiać pętli
+                raise RuntimeError(f"[BREVO] Błąd krytyczny API: HTTP {resp.status_code} – {resp.text}")
+                
+        except requests.RequestException as e:
+            print(f"[BREVO] Błąd sieci/połączenia: {e} | próba {attempt}/{max_attempts}")
+            if attempt == max_attempts:
+                raise RuntimeError(f"[BREVO] Nie udało się wysłać raportu po {max_attempts} próbach.") from e
+        
+        # Wykładniczy czas oczekiwania (2s, 4s...) + losowy ułamek sekundy
+        sleep_s = (2 ** attempt) + random.random()
+        print(f"[BREVO] Ponowienie za {sleep_s:.1f}s...")
+        time.sleep(sleep_s)
 
 
 def main():
