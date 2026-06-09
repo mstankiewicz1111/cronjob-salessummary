@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 from collections import defaultdict
 
-# Nowy import do obsługi PostgreSQL (efektywny zapis zbiorczy)
+# Importy do obsługi PostgreSQL (efektywny zapis zbiorczy)
 import psycopg2
 from psycopg2.extras import execute_values
 
@@ -24,7 +24,7 @@ IDOSELL_ENDPOINT = os.environ.get(
 BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "").strip()
 MAIL_FROM = os.environ.get("MAIL_FROM", "").strip()
 MAIL_TO = os.environ.get("MAIL_TO", "").strip() 
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip() # Nowa zmienna dla PostgreSQL
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 TZ_NAME = os.environ.get("TZ", "Europe/Warsaw").strip()
 
@@ -164,9 +164,9 @@ def detect_order_source(order: dict) -> str:
     return "sklep"
 
 
-def top_n_products(d: dict[str, float], n: int) -> list[tuple[str, int | float]]:
+def top_n_products(d: dict[tuple[str, str], float], n: int) -> list[tuple[tuple[str, str], int | float]]:
     items = sorted(d.items(), key=lambda x: x[1], reverse=True)[:n]
-    return [(name, fmt_qty(qty)) for name, qty in items]
+    return [((name, pid), fmt_qty(qty)) for (name, pid), qty in items]
 
 
 def _safe_float(x) -> float:
@@ -196,6 +196,7 @@ def aggregate_report(orders: list[dict]) -> dict:
     orders_allegro_ids = set()
     daily_order_ids = set()
 
+    # Kluczem jest teraz krotka (product_name, product_id)
     product_qty_sklep = defaultdict(float)
     product_qty_allegro = defaultdict(float)
 
@@ -223,13 +224,15 @@ def aggregate_report(orders: list[dict]) -> dict:
 
         for product in order.get("orderDetails", {}).get("productsResults", []):
             product_name = str(product.get("productName") or "Nieznany Produkt").strip()
+            product_id = str(product.get("productId") or "0").strip()
+            
             qv = product.get("productQuantity")
             qty = _safe_float(qv)
 
             if source == "allegro":
-                product_qty_allegro[product_name] += qty
+                product_qty_allegro[(product_name, product_id)] += qty
             else:
-                product_qty_sklep[product_name] += qty
+                product_qty_sklep[(product_name, product_id)] += qty
 
     currency_note = ""
     if len(currencies_seen) > 1:
@@ -245,7 +248,6 @@ def aggregate_report(orders: list[dict]) -> dict:
         "orders_total_count": len(daily_order_ids),
         "top_sklep": top_n_products(product_qty_sklep, TOP_N),
         "top_allegro": top_n_products(product_qty_allegro, TOP_N),
-        # Przekazujemy pełne słowniki do celów zapisu w BD (analiza trendów wymaga całości danych)
         "raw_sklep": product_qty_sklep,
         "raw_allegro": product_qty_allegro
     }
@@ -253,45 +255,45 @@ def aggregate_report(orders: list[dict]) -> dict:
 
 def save_sales_to_postgres(report_label: str, agg: dict) -> None:
     """
-    Automatycznie tworzy tabelę (jeśli nie istnieje) i zapisuje pełne 
-    dane sprzedażowe dnia do bazy danych PostgreSQL.
+    Automatycznie tworzy nową wersję tabeli i zapisuje pełne 
+    dane sprzedażowe dnia (wraz z ID produktu) do bazy PostgreSQL.
     """
     if not DATABASE_URL:
         print("[POSTGRES] Brak zmiennej DATABASE_URL. Pomijam zapis do bazy.", file=sys.stderr)
         return
 
-    # 1. KOD SQL, który sam przygotuje bazę danych przy pierwszym uruchomieniu
+    # Nowa tabela uwzględniająca product_id oraz klucz unikalny na nim oparty
     create_table_sql = """
-    CREATE TABLE IF NOT EXISTS daily_product_sales (
+    CREATE TABLE IF NOT EXISTS daily_sales_by_product (
         id SERIAL PRIMARY KEY,
         sale_date DATE NOT NULL,
+        product_id VARCHAR(50) NOT NULL,
         product_name VARCHAR(255) NOT NULL,
         source VARCHAR(50) NOT NULL,
         quantity NUMERIC(10, 2) NOT NULL,
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-        CONSTRAINT unique_date_product_source UNIQUE (sale_date, product_name, source)
+        CONSTRAINT unique_date_pid_source UNIQUE (sale_date, product_id, source)
     );
-    CREATE INDEX IF NOT EXISTS idx_sales_date_product ON daily_product_sales(sale_date, product_name);
+    CREATE INDEX IF NOT EXISTS idx_sales_by_prod_date ON daily_sales_by_product(sale_date, product_id);
     """
 
-    # 2. Budowanie paczki danych do wstawienia
     records = []
-    for name, qty in agg["raw_sklep"].items():
-        records.append((report_label, name, "sklep", qty))
+    for (name, pid), qty in agg["raw_sklep"].items():
+        records.append((report_label, pid, name, "sklep", qty))
         
-    for name, qty in agg["raw_allegro"].items():
-        records.append((report_label, name, "allegro", qty))
+    for (name, pid), qty in agg["raw_allegro"].items():
+        records.append((report_label, pid, name, "allegro", qty))
 
     if not records:
         print("[POSTGRES] Brak danych o produktach do zapisania za ten dzień.")
         return
 
-    # Zapytanie korzystające z UPSERT (INSERT ... ON CONFLICT)
+    # Jeśli nazwa produktu ulegnie zmianie, baza ją nadpisze na aktualną wersję
     insert_sql = """
-        INSERT INTO daily_product_sales (sale_date, product_name, source, quantity)
+        INSERT INTO daily_sales_by_product (sale_date, product_id, product_name, source, quantity)
         VALUES %s
-        ON CONFLICT (sale_date, product_name, source)
-        DO UPDATE SET quantity = EXCLUDED.quantity;
+        ON CONFLICT (sale_date, product_id, source)
+        DO UPDATE SET quantity = EXCLUDED.quantity, product_name = EXCLUDED.product_name;
     """
 
     print("[POSTGRES] Łączenie z bazą danych...")
@@ -299,27 +301,62 @@ def save_sales_to_postgres(report_label: str, agg: dict) -> None:
         conn = psycopg2.connect(DATABASE_URL)
         with conn:
             with conn.cursor() as cur:
-                # Najpierw wykonujemy polecenie utworzenia tabeli (jeśli jej nie ma)
                 cur.execute(create_table_sql)
-                
-                # Potem bezpiecznie wrzucamy dane
-                print(f"[POSTGRES] Zapisywanie {len(records)} rekordów...")
+                print(f"[POSTGRES] Zapisywanie {len(records)} rekordów do daily_sales_by_product...")
                 execute_values(cur, insert_sql, records)
         conn.close()
-        print("[POSTGRES] Sukces! Tabela zweryfikowana, dane zostały zapisane w bazie.")
+        print("[POSTGRES] Sukces! Dane produktowe (z ID) zostały zapisane.")
     except Exception as e:
         print(f"[POSTGRES] BŁĄD ZAPISU DO BAZY: {e}", file=sys.stderr)
 
-def render_table(rows: list[tuple[str, int | float]]) -> str:
+
+def get_sales_trends_from_db(end_date_str: str, days_back: int, limit: int = 5) -> list:
+    """
+    Pobiera z bazy TOP N najlepiej sprzedających się produktów w oknie czasowym.
+    Zwraca strukturę: [((product_name, product_id), total_qty), ...]
+    """
+    if not DATABASE_URL:
+        return []
+
+    end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+    start_date = end_date - timedelta(days=days_back - 1)
+    start_date_str = start_date.strftime("%Y-%m-%d")
+
+    query = """
+        SELECT product_id, MAX(product_name) as p_name, SUM(quantity) as total_qty
+        FROM daily_sales_by_product
+        WHERE sale_date BETWEEN %s AND %s
+        GROUP BY product_id
+        ORDER BY total_qty DESC
+        LIMIT %s;
+    """
+
+    trends = []
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (start_date_str, end_date_str, limit))
+                rows = cur.fetchall()
+                trends = [((row[1], row[0]), fmt_qty(row[2])) for row in rows]
+        conn.close()
+    except Exception as e:
+        print(f"[POSTGRES] Błąd podczas pobierania trendów ({days_back} dni): {e}", file=sys.stderr)
+    
+    return trends
+
+
+def render_table(rows: list) -> str:
     if not rows:
         return '<p style="margin:6px 0;color:#666;">Brak sprzedaży w tym kanale w danym dniu.</p>'
 
     body = ""
-    for i, (name, qty) in enumerate(rows, start=1):
+    for i, ((name, pid), qty) in enumerate(rows, start=1):
+        display_name = f"{name} | ID {pid}" if pid and pid != "0" else name
         body += f"""
           <tr>
             <td style="padding:6px 8px;border-bottom:1px solid #eee;">{i}.</td>
-            <td style="padding:6px 8px;border-bottom:1px solid #eee;">{name}</td>
+            <td style="padding:6px 8px;border-bottom:1px solid #eee;">{display_name}</td>
             <td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">{qty}</td>
           </tr>
         """
@@ -340,28 +377,53 @@ def render_table(rows: list[tuple[str, int | float]]) -> str:
     """
 
 
-def build_email_html(report_label: str, agg: dict) -> str:
+def build_email_html(report_label: str, agg: dict, trends_3d: list, trends_7d: list) -> str:
     total_value_str = fmt_money_pln(agg["total_revenue"]) + agg.get("currency_note", "")
 
-    return f"""
-    <div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.4;">
-      <h2 style="margin:0 0 10px;">Raport zamówień — {report_label}</h2>
+    def render_trend_list(trends):
+        if not trends:
+            return '<p style="color:#666; margin:4px 0;">Brak danych historycznych w bazie.</p>'
+        
+        li_items = ""
+        for (name, pid), qty in trends:
+            display_name = f"{name} | ID {pid}" if pid and pid != "0" else name
+            li_items += f"<li>{display_name} (<b>{qty} szt.</b>)</li>"
+            
+        return f'<ul style="margin:4px 0 0 18px; padding:0; line-height:1.5;">{li_items}</ul>'
 
-      <h3 style="margin:16px 0 6px;">Podsumowanie</h3>
+    return f"""
+    <div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.4; color:#333;">
+      <h2 style="margin:0 0 10px; color:#111;">Raport zamówień — {report_label}</h2>
+
+      <h3 style="margin:16px 0 6px; color:#222; border-bottom:1px solid #eee; padding-bottom:4px;">Podsumowanie dnia</h3>
       <ul style="margin:6px 0 0 18px;">
         <li>Liczba zamówień (Sklep): <b>{agg['orders_sklep_count']}</b></li>
         <li>Liczba zamówień (Allegro): <b>{agg['orders_allegro_count']}</b></li>
         <li>Łączna liczba zamówień: <b>{agg['orders_total_count']}</b></li>
-        <li><b>Łączna wartość zamówień:</b> <b>{total_value_str}</b></li>
+        <li><b>Łączna wartość zamówień:</b> <span style="color:#d32f2f;"><b>{total_value_str}</b></span></li>
       </ul>
 
-      <h3 style="margin:16px 0 6px;">Top {TOP_N} sprzedanych towarów — Sklep</h3>
+      <h3 style="margin:20px 0 6px; color:#0288d1; border-bottom:1px solid #e0f2fe; padding-bottom:4px;">📈 Trendy sprzedażowe (Sklep + Allegro)</h3>
+      <table style="width:100%; max-width:900px; border-collapse:collapse;">
+        <tr>
+          <td style="width:50%; vertical-align:top; padding-right:10px;">
+            <h4 style="margin:4px 0; color:#555;">Top 5 produktów (Ostatnie 3 dni):</h4>
+            {render_trend_list(trends_3d)}
+          </td>
+          <td style="width:50%; vertical-align:top; padding-left:10px; border-left:1px solid #eee;">
+            <h4 style="margin:4px 0; color:#555;">Top 5 produktów (Ostatnie 7 dni):</h4>
+            {render_trend_list(trends_7d)}
+          </td>
+        </tr>
+      </table>
+
+      <h3 style="margin:20px 0 6px; color:#222; border-bottom:1px solid #eee; padding-bottom:4px;">Top {TOP_N} dnia — Sklep</h3>
       {render_table(agg['top_sklep'])}
 
-      <h3 style="margin:16px 0 6px;">Top {TOP_N} sprzedanych towarów — Allegro</h3>
+      <h3 style="margin:20px 0 6px; color:#222; border-bottom:1px solid #eee; padding-bottom:4px;">Top {TOP_N} dnia — Allegro</h3>
       {render_table(agg['top_allegro'])}
 
-      <p style="margin-top:16px;color:#666;">
+      <p style="margin-top:25px; font-size:12px; color:#888;">
         Wygenerowano automatycznie (strefa czasowa: {TZ_NAME}).
       </p>
     </div>
@@ -399,9 +461,8 @@ def main():
     require_env("BREVO_API_KEY", BREVO_API_KEY)
     require_env("MAIL_FROM", MAIL_FROM)
     require_env("MAIL_TO", MAIL_TO)
-    # Wyświetli ostrzeżenie w logach, jeśli zapomnisz dodać zmiennej do Rendera
     if not DATABASE_URL:
-        print("[OSTRZEŻENIE] Brak zmiennej DATABASE_URL. Dane nie będą zapisywane historycznie.", file=sys.stderr)
+        print("[OSTRZEŻENIE] Brak zmiennej DATABASE_URL. Dane nie będą analizowane.", file=sys.stderr)
 
     report_label, start_str, end_str = get_report_range(days_back=1)
     print(f"[RANGE] {start_str} -> {end_str}")
@@ -409,11 +470,17 @@ def main():
     orders = fetch_orders_for_range(start_str, end_str)
     agg = aggregate_report(orders)
 
-    # NOWOŚĆ: Wywołanie zapisu do PostgreSQL
+    # 1. Zapisujemy dane do bazy (nowa tabela z obsługą ID)
     save_sales_to_postgres(report_label, agg)
 
+    # 2. Pobieramy trendy historyczne bazując na ID produktu
+    print("[POSTGRES] Pobieranie trendów produktowych...")
+    trends_3d = get_sales_trends_from_db(report_label, days_back=3, limit=5)
+    trends_7d = get_sales_trends_from_db(report_label, days_back=7, limit=5)
+
+    # 3. Wysyłamy maila
     subject = f"Raport zamówień — {report_label}"
-    html = build_email_html(report_label, agg)
+    html = build_email_html(report_label, agg, trends_3d, trends_7d)
 
     send_email(subject, html)
 
