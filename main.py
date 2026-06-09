@@ -7,6 +7,10 @@ from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 from collections import defaultdict
 
+# Nowy import do obsługi PostgreSQL (efektywny zapis zbiorczy)
+import psycopg2
+from psycopg2.extras import execute_values
+
 
 # =========================
 # Konfiguracja (ENV)
@@ -19,10 +23,11 @@ IDOSELL_ENDPOINT = os.environ.get(
 
 BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "").strip()
 MAIL_FROM = os.environ.get("MAIL_FROM", "").strip()
-MAIL_TO = os.environ.get("MAIL_TO", "").strip()  # lista po przecinku
+MAIL_TO = os.environ.get("MAIL_TO", "").strip() 
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip() # Nowa zmienna dla PostgreSQL
+
 TZ_NAME = os.environ.get("TZ", "Europe/Warsaw").strip()
 
-# Statusy zamówień
 ORDER_STATUSES = [
     "new", "finished", "on_order", "packed", "ready",
     "payment_waiting", "delivery_waiting", "wait_for_dispatch"
@@ -30,11 +35,7 @@ ORDER_STATUSES = [
 
 RESULTS_LIMIT = int(os.environ.get("RESULTS_LIMIT", "100"))
 TOP_N = int(os.environ.get("TOP_N", "10"))
-
-# Bezpiecznik na wypadek zapętlenia/paginacji “nigdy nie kończy”
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "2000"))
-
-# Timeouty: (connect, read)
 HTTP_TIMEOUT = (10, 60)
 
 
@@ -49,15 +50,10 @@ def fmt_qty(x: float):
 
 
 def fmt_money_pln(x: float) -> str:
-    # proste formatowanie 2 miejsca po przecinku
     return f"{x:.2f} zł"
 
 
 def get_report_range(days_back: int = 1):
-    """
-    Raport za 'wczoraj' w strefie TZ_NAME.
-    Zwraca: (label_YYYY_MM_DD, start_str, end_str)
-    """
     tz = ZoneInfo(TZ_NAME)
     now = datetime.now(tz)
     report_date = now.date() - timedelta(days=days_back)
@@ -73,9 +69,6 @@ def get_report_range(days_back: int = 1):
 
 
 def _post_with_retry(url: str, payload: dict, headers: dict, *, max_attempts: int = 5) -> requests.Response:
-    """
-    POST z retry na problemy sieciowe + 429 + 5xx.
-    """
     for attempt in range(1, max_attempts + 1):
         try:
             resp = requests.post(url, json=payload, headers=headers, timeout=HTTP_TIMEOUT)
@@ -101,10 +94,6 @@ def _post_with_retry(url: str, payload: dict, headers: dict, *, max_attempts: in
 
 
 def fetch_orders_for_range(start_str: str, end_str: str) -> list[dict]:
-    """
-    Pobiera wszystkie zamówienia z IdoSell w zadanym zakresie dat, z paginacją.
-    IdoSell może zwrócić HTTP 207 dla pustej strony ("zwrócono pusty wynik") — traktujemy to jako koniec.
-    """
     headers = {
         "Content-Type": "application/json",
         "X-API-KEY": IDOSELL_API_KEY,
@@ -136,7 +125,6 @@ def fetch_orders_for_range(start_str: str, end_str: str) -> list[dict]:
 
         resp = _post_with_retry(IDOSELL_ENDPOINT, payload, headers)
 
-        # IdoSell: 207 = “pusto / koniec”
         if resp.status_code == 207:
             print(f"[IDOSELL] Koniec wyników (HTTP 207): {resp.text}")
             break
@@ -166,9 +154,6 @@ def fetch_orders_for_range(start_str: str, end_str: str) -> list[dict]:
 
 
 def detect_order_source(order: dict) -> str:
-    """
-    'allegro' lub 'sklep' — na podstawie auctionsServiceName.
-    """
     auctions_service_name = (
         order.get("orderDetails", {})
              .get("orderSourceResults", {})
@@ -192,16 +177,6 @@ def _safe_float(x) -> float:
 
 
 def extract_order_gross_value(order: dict) -> tuple[float, str]:
-    """
-    Liczy wartość zamówienia na podstawie:
-      orderDetails.payments.orderCurrency:
-        - orderProductsCost
-        - orderDeliveryCost
-        - orderPayformCost
-        - orderInsuranceCost
-
-    Zwraca: (wartość, waluta)
-    """
     payments = order.get("orderDetails", {}).get("payments", {}) or {}
     oc = payments.get("orderCurrency", {}) or {}
 
@@ -217,10 +192,6 @@ def extract_order_gross_value(order: dict) -> tuple[float, str]:
 
 
 def aggregate_report(orders: list[dict]) -> dict:
-    """
-    Zwraca metryki + top N osobno dla sklepu i Allegro
-    oraz łączną wartość zamówień (brutto) wg orderCurrency.
-    """
     orders_sklep_ids = set()
     orders_allegro_ids = set()
     daily_order_ids = set()
@@ -230,8 +201,6 @@ def aggregate_report(orders: list[dict]) -> dict:
 
     total_revenue = 0.0
     currencies_seen = set()
-
-    # Na wszelki wypadek: nie licz dwa razy tego samego orderId
     revenue_counted_for = set()
 
     for order in orders:
@@ -239,7 +208,6 @@ def aggregate_report(orders: list[dict]) -> dict:
         if order_id:
             daily_order_ids.add(order_id)
 
-        # SUMA WARTOŚCI ZAMÓWIEŃ (BRUTTO)
         if order_id and order_id not in revenue_counted_for:
             order_value, currency = extract_order_gross_value(order)
             total_revenue += order_value
@@ -256,7 +224,6 @@ def aggregate_report(orders: list[dict]) -> dict:
         for product in order.get("orderDetails", {}).get("productsResults", []):
             product_name = str(product.get("productName") or "Nieznany Produkt").strip()
             qv = product.get("productQuantity")
-
             qty = _safe_float(qv)
 
             if source == "allegro":
@@ -278,14 +245,105 @@ def aggregate_report(orders: list[dict]) -> dict:
         "orders_total_count": len(daily_order_ids),
         "top_sklep": top_n_products(product_qty_sklep, TOP_N),
         "top_allegro": top_n_products(product_qty_allegro, TOP_N),
+        # Przekazujemy pełne słowniki do celów zapisu w BD (analiza trendów wymaga całości danych)
+        "raw_sklep": product_qty_sklep,
+        "raw_allegro": product_qty_allegro
     }
+
+
+def save_sales_to_postgres(report_label: str, agg: dict) -> None:
+    """
+    Automatycznie tworzy tabelę (jeśli nie istnieje) i zapisuje pełne 
+    dane sprzedażowe dnia do bazy danych PostgreSQL.
+    """
+    if not DATABASE_URL:
+        print("[POSTGRES] Brak zmiennej DATABASE_URL. Pomijam zapis do bazy.", file=sys.stderr)
+        return
+
+    # 1. KOD SQL, który sam przygotuje bazę danych przy pierwszym uruchomieniu
+    create_table_sql = """
+    CREATE TABLE IF NOT EXISTS daily_product_sales (
+        id SERIAL PRIMARY KEY,
+        sale_date DATE NOT NULL,
+        product_name VARCHAR(255) NOT NULL,
+        source VARCHAR(50) NOT NULL,
+        quantity NUMERIC(10, 2) NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT unique_date_product_source UNIQUE (sale_date, product_name, source)
+    );
+    CREATE INDEX IF NOT EXISTS idx_sales_date_product ON daily_product_sales(sale_date, product_name);
+    """
+
+    # 2. Budowanie paczki danych do wstawienia
+    records = []
+    for name, qty in agg["raw_sklep"].items():
+        records.append((report_label, name, "sklep", qty))
+        
+    for name, qty in agg["raw_allegro"].items():
+        records.append((report_label, name, "allegro", qty))
+
+    if not records:
+        print("[POSTGRES] Brak danych o produktach do zapisania za ten dzień.")
+        return
+
+    insert_sql = """
+        INSERT INTO daily_product_sales (sale_date, product_name, source, quantity)
+        VALUES %s
+        ON CONFLICT (sale_date, product_name, source)
+        DO UPDATE SET quantity = EXCLUDED.quantity;
+    """
+
+    print("[POSTGRES] Łączenie z bazą danych...")
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                # Najpierw wykonujemy polecenie utworzenia tabeli (jeśli jej nie ma)
+                cur.execute(create_table_sql)
+                
+                # Potem bezpiecznie wrzucamy dane
+                print(f"[POSTGRES] Zapisywanie {len(records)} rekordów...")
+                execute_values(cur, insert_sql, records)
+        conn.close()
+        print("[POSTGRES] Sukces! Tabela zweryfikowana, dane zostały zapisane.")
+    except Exception as e:
+        print(f"[POSTGRES] BŁĄD ZAPISU DO BAZY: {e}", file=sys.stderr)
+    
+    # Budowanie jednej paczki danych (batch) do zapisu
+    for name, qty in agg["raw_sklep"].items():
+        records.append((report_label, name, "sklep", qty))
+        
+    for name, qty in agg["raw_allegro"].items():
+        records.append((report_label, name, "allegro", qty))
+
+    if not records:
+        print("[POSTGRES] Brak danych o produktach do zapisania za ten dzień.")
+        return
+
+    # Zapytanie korzystające z UPSERT (INSERT ... ON CONFLICT)
+    query = """
+        INSERT INTO daily_product_sales (sale_date, product_name, source, quantity)
+        VALUES %s
+        ON CONFLICT (sale_date, product_name, source)
+        DO UPDATE SET quantity = EXCLUDED.quantity;
+    """
+
+    print(f"[POSTGRES] Rozpoczynam zapis {len(records)} rekordów do bazy danych...")
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                execute_values(cur, query, records)
+        conn.close()
+        print("[POSTGRES] Dane zostały pomyślnie zapisane w bazie.")
+    except Exception as e:
+        # Rejestrujemy błąd, ale nie wysypujemy całego skryptu, żeby mail i tak wyszedł
+        print(f"[POSTGRES] BŁĄD ZAPISU DO BAZY: {e}", file=sys.stderr)
 
 
 def render_table(rows: list[tuple[str, int | float]]) -> str:
     if not rows:
-        return """
-        <p style="margin:6px 0;color:#666;">Brak sprzedaży w tym kanale w danym dniu.</p>
-        """
+        return '<p style="margin:6px 0;color:#666;">Brak sprzedaży w tym kanale w danym dniu.</p>'
 
     body = ""
     for i, (name, qty) in enumerate(rows, start=1):
@@ -344,7 +402,7 @@ def build_email_html(report_label: str, agg: dict) -> str:
 def send_email(subject: str, html: str) -> None:
     recipients = [x.strip() for x in MAIL_TO.split(",") if x.strip()]
     if not recipients:
-        raise RuntimeError("MAIL_TO jest puste albo w złym formacie (użyj przecinków).")
+        raise RuntimeError("MAIL_TO jest puste albo w złym formacie.")
 
     url = "https://api.brevo.com/v3/smtp/email"
     headers = {
@@ -361,8 +419,6 @@ def send_email(subject: str, html: str) -> None:
     }
 
     resp = requests.post(url, json=payload, headers=headers, timeout=HTTP_TIMEOUT)
-
-    # Brevo zwykle zwraca 201 Created dla poprawnej wysyłki
     if resp.status_code not in (200, 201, 202):
         raise RuntimeError(f"[BREVO] Błąd wysyłki: HTTP {resp.status_code} – {resp.text}")
 
@@ -374,12 +430,18 @@ def main():
     require_env("BREVO_API_KEY", BREVO_API_KEY)
     require_env("MAIL_FROM", MAIL_FROM)
     require_env("MAIL_TO", MAIL_TO)
+    # Wyświetli ostrzeżenie w logach, jeśli zapomnisz dodać zmiennej do Rendera
+    if not DATABASE_URL:
+        print("[OSTRZEŻENIE] Brak zmiennej DATABASE_URL. Dane nie będą zapisywane historycznie.", file=sys.stderr)
 
     report_label, start_str, end_str = get_report_range(days_back=1)
     print(f"[RANGE] {start_str} -> {end_str}")
 
     orders = fetch_orders_for_range(start_str, end_str)
     agg = aggregate_report(orders)
+
+    # NOWOŚĆ: Wywołanie zapisu do PostgreSQL
+    save_sales_to_postgres(report_label, agg)
 
     subject = f"Raport zamówień — {report_label}"
     html = build_email_html(report_label, agg)
