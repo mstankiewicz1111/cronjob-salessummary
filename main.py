@@ -196,7 +196,6 @@ def aggregate_report(orders: list[dict]) -> dict:
     orders_allegro_ids = set()
     daily_order_ids = set()
 
-    # Kluczem jest teraz krotka (product_name, product_id)
     product_qty_sklep = defaultdict(float)
     product_qty_allegro = defaultdict(float)
 
@@ -262,7 +261,6 @@ def save_sales_to_postgres(report_label: str, agg: dict) -> None:
         print("[POSTGRES] Brak zmiennej DATABASE_URL. Pomijam zapis do bazy.", file=sys.stderr)
         return
 
-    # Nowa tabela uwzględniająca product_id oraz klucz unikalny na nim oparty
     create_table_sql = """
     CREATE TABLE IF NOT EXISTS daily_sales_by_product (
         id SERIAL PRIMARY KEY,
@@ -288,7 +286,6 @@ def save_sales_to_postgres(report_label: str, agg: dict) -> None:
         print("[POSTGRES] Brak danych o produktach do zapisania za ten dzień.")
         return
 
-    # Jeśli nazwa produktu ulegnie zmianie, baza ją nadpisze na aktualną wersję
     insert_sql = """
         INSERT INTO daily_sales_by_product (sale_date, product_id, product_name, source, quantity)
         VALUES %s
@@ -352,8 +349,13 @@ def render_table(rows: list) -> str:
 
     body = ""
     for i, ((name, pid), qty) in enumerate(rows, start=1):
-        display_name = f"{name} <span style='color:#888; font-size:12px; white-space:nowrap;'>| ID {pid}</span>" if pid and pid != "0" else name
-        # Delikatne, naprzemienne tła wierszy dla lepszej czytelności tabeli
+        # MODYFIKACJA: Dodanie hiperłącza do ID i nazwy produktu
+        if pid and pid != "0":
+            product_url = f"https://wassyl.pl/product-pol-{pid}"
+            display_name = f"<a href='{product_url}' style='color:#0288d1; text-decoration:underline; font-weight:500;'>{name}</a> <span style='color:#888; font-size:12px; white-space:nowrap;'>| ID {pid}</span>"
+        else:
+            display_name = name
+
         bg_color = "#ffffff" if i % 2 != 0 else "#fafafa"
         body += f"""
           <tr style="background-color: {bg_color};">
@@ -384,14 +386,19 @@ def render_table(rows: list) -> str:
 def build_email_html(report_label: str, agg: dict, trends_3d: list, trends_7d: list) -> str:
     total_value_str = fmt_money_pln(agg["total_revenue"]) + agg.get("currency_note", "")
 
-    # Pomocnicza funkcja generująca mikro-tabelę wewnątrz karty trendów
     def render_trend_list(trends):
         if not trends:
             return '<p style="color:#666; margin:4px 0; font-size:13px; font-style:italic;">Zbieranie danych historycznych w toku...</p>'
         
         table_rows = ""
         for i, ((name, pid), qty) in enumerate(trends, start=1):
-            display_name = f"{name} <span style='color:#888; font-size:11px; white-space:nowrap;'>| ID {pid}</span>" if pid and pid != "0" else name
+            # MODYFIKACJA: Dodanie hiperłącza do trendów produktowych
+            if pid and pid != "0":
+                product_url = f"https://wassyl.pl/product-pol-{pid}"
+                display_name = f"<a href='{product_url}' style='color:#026aa7; text-decoration:underline; font-weight:500;'>{name}</a> <span style='color:#888; font-size:11px; white-space:nowrap;'>| ID {pid}</span>"
+            else:
+                display_name = name
+
             table_rows += f"""
               <tr style="border-bottom: 1px solid #eef2f5;">
                 <td style="padding: 6px 0; font-size: 13px; color: #666; width: 20px; vertical-align: top;">{i}.</td>
@@ -456,59 +463,6 @@ def build_email_html(report_label: str, agg: dict, trends_3d: list, trends_7d: l
     """
 
 
-def build_email_html(report_label: str, agg: dict, trends_3d: list, trends_7d: list) -> str:
-    total_value_str = fmt_money_pln(agg["total_revenue"]) + agg.get("currency_note", "")
-
-    def render_trend_list(trends):
-        if not trends:
-            return '<p style="color:#666; margin:4px 0;">Brak danych historycznych w bazie.</p>'
-        
-        li_items = ""
-        for (name, pid), qty in trends:
-            display_name = f"{name} | ID {pid}" if pid and pid != "0" else name
-            li_items += f"<li>{display_name} (<b>{qty} szt.</b>)</li>"
-            
-        return f'<ul style="margin:4px 0 0 18px; padding:0; line-height:1.5;">{li_items}</ul>'
-
-    return f"""
-    <div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.4; color:#333;">
-      <h2 style="margin:0 0 10px; color:#111;">Raport zamówień — {report_label}</h2>
-
-      <h3 style="margin:16px 0 6px; color:#222; border-bottom:1px solid #eee; padding-bottom:4px;">Podsumowanie dnia</h3>
-      <ul style="margin:6px 0 0 18px;">
-        <li>Liczba zamówień (Sklep): <b>{agg['orders_sklep_count']}</b></li>
-        <li>Liczba zamówień (Allegro): <b>{agg['orders_allegro_count']}</b></li>
-        <li>Łączna liczba zamówień: <b>{agg['orders_total_count']}</b></li>
-        <li><b>Łączna wartość zamówień:</b> <span style="color:#d32f2f;"><b>{total_value_str}</b></span></li>
-      </ul>
-
-      <h3 style="margin:20px 0 6px; color:#0288d1; border-bottom:1px solid #e0f2fe; padding-bottom:4px;">📈 Trendy sprzedażowe (Sklep + Allegro)</h3>
-      <table style="width:100%; max-width:900px; border-collapse:collapse;">
-        <tr>
-          <td style="width:50%; vertical-align:top; padding-right:10px;">
-            <h4 style="margin:4px 0; color:#555;">Top 5 produktów (Ostatnie 3 dni):</h4>
-            {render_trend_list(trends_3d)}
-          </td>
-          <td style="width:50%; vertical-align:top; padding-left:10px; border-left:1px solid #eee;">
-            <h4 style="margin:4px 0; color:#555;">Top 5 produktów (Ostatnie 7 dni):</h4>
-            {render_trend_list(trends_7d)}
-          </td>
-        </tr>
-      </table>
-
-      <h3 style="margin:20px 0 6px; color:#222; border-bottom:1px solid #eee; padding-bottom:4px;">Top {TOP_N} dnia — Sklep</h3>
-      {render_table(agg['top_sklep'])}
-
-      <h3 style="margin:20px 0 6px; color:#222; border-bottom:1px solid #eee; padding-bottom:4px;">Top {TOP_N} dnia — Allegro</h3>
-      {render_table(agg['top_allegro'])}
-
-      <p style="margin-top:25px; font-size:12px; color:#888;">
-        Wygenerowano automatycznie (strefa czasowa: {TZ_NAME}).
-      </p>
-    </div>
-    """
-
-
 def send_email(subject: str, html: str, max_attempts: int = 3) -> None:
     recipients = [x.strip() for x in MAIL_TO.split(",") if x.strip()]
     if not recipients:
@@ -521,7 +475,6 @@ def send_email(subject: str, html: str, max_attempts: int = 3) -> None:
         "content-type": "application/json",
     }
 
-    # Pobieramy nazwę z ENV, a jeśli jej nie ma, podstawiamy "WASSYL | raport sprzedaży"
     sender_name = os.environ.get("MAIL_FROM_NAME", "WASSYL | raport sprzedaży").strip()
 
     payload = {
@@ -571,15 +524,12 @@ def main():
     orders = fetch_orders_for_range(start_str, end_str)
     agg = aggregate_report(orders)
 
-    # 1. Zapisujemy dane do bazy (nowa tabela z obsługą ID)
     save_sales_to_postgres(report_label, agg)
 
-    # 2. Pobieramy trendy historyczne bazując na ID produktu
     print("[POSTGRES] Pobieranie trendów produktowych...")
     trends_3d = get_sales_trends_from_db(report_label, days_back=3, limit=5)
     trends_7d = get_sales_trends_from_db(report_label, days_back=7, limit=5)
 
-    # 3. Wysyłamy maila
     subject = f"Raport zamówień — {report_label}"
     html = build_email_html(report_label, agg, trends_3d, trends_7d)
 
