@@ -286,6 +286,7 @@ def save_sales_to_postgres(report_label: str, agg: dict) -> None:
         print("[POSTGRES] Brak danych o produktach do zapisania za ten dzień.")
         return
 
+    # Zapytanie korzystające z UPSERT (INSERT ... ON CONFLICT)
     insert_sql = """
         INSERT INTO daily_product_sales (sale_date, product_name, source, quantity)
         VALUES %s
@@ -305,41 +306,9 @@ def save_sales_to_postgres(report_label: str, agg: dict) -> None:
                 print(f"[POSTGRES] Zapisywanie {len(records)} rekordów...")
                 execute_values(cur, insert_sql, records)
         conn.close()
-        print("[POSTGRES] Sukces! Tabela zweryfikowana, dane zostały zapisane.")
+        print("[POSTGRES] Sukces! Tabela zweryfikowana, dane zostały zapisane w bazie.")
     except Exception as e:
         print(f"[POSTGRES] BŁĄD ZAPISU DO BAZY: {e}", file=sys.stderr)
-    
-    # Budowanie jednej paczki danych (batch) do zapisu
-    for name, qty in agg["raw_sklep"].items():
-        records.append((report_label, name, "sklep", qty))
-        
-    for name, qty in agg["raw_allegro"].items():
-        records.append((report_label, name, "allegro", qty))
-
-    if not records:
-        print("[POSTGRES] Brak danych o produktach do zapisania za ten dzień.")
-        return
-
-    # Zapytanie korzystające z UPSERT (INSERT ... ON CONFLICT)
-    query = """
-        INSERT INTO daily_product_sales (sale_date, product_name, source, quantity)
-        VALUES %s
-        ON CONFLICT (sale_date, product_name, source)
-        DO UPDATE SET quantity = EXCLUDED.quantity;
-    """
-
-    print(f"[POSTGRES] Rozpoczynam zapis {len(records)} rekordów do bazy danych...")
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        with conn:
-            with conn.cursor() as cur:
-                execute_values(cur, query, records)
-        conn.close()
-        print("[POSTGRES] Dane zostały pomyślnie zapisane w bazie.")
-    except Exception as e:
-        # Rejestrujemy błąd, ale nie wysypujemy całego skryptu, żeby mail i tak wyszedł
-        print(f"[POSTGRES] BŁĄD ZAPISU DO BAZY: {e}", file=sys.stderr)
-
 
 def render_table(rows: list[tuple[str, int | float]]) -> str:
     if not rows:
