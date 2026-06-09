@@ -348,32 +348,111 @@ def get_sales_trends_from_db(end_date_str: str, days_back: int, limit: int = 5) 
 
 def render_table(rows: list) -> str:
     if not rows:
-        return '<p style="margin:6px 0;color:#666;">Brak sprzedaży w tym kanale w danym dniu.</p>'
+        return '<p style="margin:6px 0; color:#666; font-size:13px; font-style:italic;">Brak sprzedaży w tym kanale w danym dniu.</p>'
 
     body = ""
     for i, ((name, pid), qty) in enumerate(rows, start=1):
-        display_name = f"{name} | ID {pid}" if pid and pid != "0" else name
+        display_name = f"{name} <span style='color:#888; font-size:12px; white-space:nowrap;'>| ID {pid}</span>" if pid and pid != "0" else name
+        # Delikatne, naprzemienne tła wierszy dla lepszej czytelności tabeli
+        bg_color = "#ffffff" if i % 2 != 0 else "#fafafa"
         body += f"""
-          <tr>
-            <td style="padding:6px 8px;border-bottom:1px solid #eee;">{i}.</td>
-            <td style="padding:6px 8px;border-bottom:1px solid #eee;">{display_name}</td>
-            <td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;">{qty}</td>
+          <tr style="background-color: {bg_color};">
+            <td style="padding:8px 10px; border-bottom:1px solid #edeef0; font-size:13px; color:#666; width:25px; vertical-align:middle;">{i}.</td>
+            <td style="padding:8px 10px; border-bottom:1px solid #edeef0; font-size:13px; color:#222; line-height:1.4;">{display_name}</td>
+            <td style="padding:8px 10px; border-bottom:1px solid #edeef0; font-size:13px; color:#111; text-align:right; font-weight:bold; width:45px; vertical-align:middle;">{qty}</td>
           </tr>
         """
 
     return f"""
-    <table style="border-collapse:collapse;width:100%;max-width:900px;">
-      <thead>
-        <tr>
-          <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #ddd;">#</th>
-          <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #ddd;">Produkt</th>
-          <th style="text-align:right;padding:6px 8px;border-bottom:2px solid #ddd;">Sztuk</th>
-        </tr>
-      </thead>
-      <tbody>
-        {body}
-      </tbody>
-    </table>
+    <div style="border: 1px solid #edeef0; border-radius: 6px; overflow: hidden; margin-top: 8px; margin-bottom: 20px;">
+      <table style="border-collapse:collapse; width:100%; background-color: #ffffff;">
+        <thead>
+          <tr style="background-color: #f8f9fa;">
+            <th style="text-align:left; padding:10px; border-bottom:2px solid #edeef0; font-size:11px; color:#666; text-transform: uppercase; font-weight:600; width:25px;">#</th>
+            <th style="text-align:left; padding:10px; border-bottom:2px solid #edeef0; font-size:11px; color:#666; text-transform: uppercase; font-weight:600;">Produkt</th>
+            <th style="text-align:right; padding:10px; border-bottom:2px solid #edeef0; font-size:11px; color:#666; text-transform: uppercase; font-weight:600; width:45px;">Sztuk</th>
+          </tr>
+        </thead>
+        <tbody>
+          {body}
+        </tbody>
+      </table>
+    </div>
+    """
+
+
+def build_email_html(report_label: str, agg: dict, trends_3d: list, trends_7d: list) -> str:
+    total_value_str = fmt_money_pln(agg["total_revenue"]) + agg.get("currency_note", "")
+
+    # Pomocnicza funkcja generująca mikro-tabelę wewnątrz karty trendów
+    def render_trend_list(trends):
+        if not trends:
+            return '<p style="color:#666; margin:4px 0; font-size:13px; font-style:italic;">Zbieranie danych historycznych w toku...</p>'
+        
+        table_rows = ""
+        for i, ((name, pid), qty) in enumerate(trends, start=1):
+            display_name = f"{name} <span style='color:#888; font-size:11px; white-space:nowrap;'>| ID {pid}</span>" if pid and pid != "0" else name
+            table_rows += f"""
+              <tr style="border-bottom: 1px solid #eef2f5;">
+                <td style="padding: 6px 0; font-size: 13px; color: #666; width: 20px; vertical-align: top;">{i}.</td>
+                <td style="padding: 6px 8px; font-size: 13px; color: #222; line-height: 1.4;">{display_name}</td>
+                <td style="padding: 6px 0; font-size: 13px; color: #0288d1; text-align: right; font-weight: bold; width: 60px; white-space: nowrap; vertical-align: top;">{qty} szt.</td>
+              </tr>
+            """
+        return f'<table style="width:100%; border-collapse:collapse;">{table_rows}</table>'
+
+    return f"""
+    <div style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,Helvetica,Arial,sans-serif; font-size:14px; line-height:1.5; color:#333333; max-width:600px; margin:0 auto; padding:10px;">
+      
+      <div style="background-color: #f8f9fa; padding: 16px 20px; border-left: 4px solid #0288d1; margin-bottom: 20px; border-radius: 4px;">
+        <h2 style="margin: 0; font-size: 18px; color: #111111; font-weight: 700;">Raport zamówień — {report_label}</h2>
+      </div>
+
+      <div style="background-color: #ffffff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 16px 20px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.02);">
+        <h3 style="margin-top: 0; margin-bottom: 14px; font-size: 15px; color: #111111; font-weight: 600; border-bottom: 1px solid #f0f0f0; padding-bottom: 6px;">📋 Podsumowanie dnia</h3>
+        <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+          <tr>
+            <td style="padding: 4px 0; color: #555;">Zamówienia (Sklep):</td>
+            <td style="padding: 4px 0; text-align: right; font-weight: bold; color: #111;">{agg['orders_sklep_count']}</td>
+          </tr>
+          <tr>
+            <td style="padding: 4px 0; color: #555;">Zamówienia (Allegro):</td>
+            <td style="padding: 4px 0; text-align: right; font-weight: bold; color: #111;">{agg['orders_allegro_count']}</td>
+          </tr>
+          <tr style="border-bottom: 1px solid #f0f0f0;">
+            <td style="padding: 4px 0 10px 0; color: #555;">Łączna liczba zamówień:</td>
+            <td style="padding: 4px 0 10px 0; text-align: right; font-weight: bold; color: #111;">{agg['orders_total_count']}</td>
+          </tr>
+          <tr>
+            <td style="padding: 10px 0 4px 0; color: #111; font-weight: 600;">Łączna wartość (brutto):</td>
+            <td style="padding: 10px 0 4px 0; text-align: right; font-weight: bold; color: #d32f2f; font-size: 16px;">{total_value_str}</td>
+          </tr>
+        </table>
+      </div>
+
+      <h3 style="margin-top: 0; margin-bottom: 12px; font-size: 15px; color: #0288d1; font-weight: 600;">📈 Trendy sprzedażowe (Sklep + Allegro)</h3>
+      
+      <div style="background-color: #f4f9fc; border: 1px solid #d0e3f0; border-radius: 8px; padding: 16px 20px; margin-bottom: 14px;">
+        <h4 style="margin-top: 0; margin-bottom: 10px; font-size: 13px; color: #026aa7; text-transform: uppercase; font-weight: 700; letter-spacing: 0.5px;">🔥 Top 5 produktów (Ostatnie 3 dni)</h4>
+        {render_trend_list(trends_3d)}
+      </div>
+
+      <div style="background-color: #f4f9fc; border: 1px solid #d0e3f0; border-radius: 8px; padding: 16px 20px; margin-bottom: 28px;">
+        <h4 style="margin-top: 0; margin-bottom: 10px; font-size: 13px; color: #026aa7; text-transform: uppercase; font-weight: 700; letter-spacing: 0.5px;">⭐️ Top 5 produktów (Ostatnie 7 dni)</h4>
+        {render_trend_list(trends_7d)}
+      </div>
+
+      <h3 style="margin-top: 0; margin-bottom: 4px; font-size: 15px; color: #111111; font-weight: 600;">🛒 Top {TOP_N} dnia — Sklep</h3>
+      {render_table(agg['top_sklep'])}
+
+      <h3 style="margin-top: 10px; margin-bottom: 4px; font-size: 15px; color: #111111; font-weight: 600;">🦅 Top {TOP_N} dnia — Allegro</h3>
+      {render_table(agg['top_allegro'])}
+
+      <p style="margin-top: 30px; font-size: 11px; color: #999999; text-align: center; border-top: 1px solid #edeef0; padding-top: 12px;">
+        Raport wygenerowany automatycznie przez system analityczny.<br>
+        Strefa czasowa: {TZ_NAME} | Dane historyczne przechowywane w PostgreSQL.
+      </p>
+    </div>
     """
 
 
