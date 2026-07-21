@@ -32,6 +32,9 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 TZ_NAME = os.environ.get("TZ", "Europe/Warsaw").strip()
 
+# Wartość priorytetu w IdoSell oznaczająca ręczną blokadę/przypięcie towaru
+LOCKED_PRIORITY = 999
+
 ORDER_STATUSES = [
     "new", "finished", "on_order", "packed", "ready",
     "payment_waiting", "delivery_waiting", "wait_for_dispatch"
@@ -338,11 +341,52 @@ def get_sales_trends_from_db(end_date_str: str, days_back: int, limit: int = 5) 
     return trends
 
 
+def get_current_product_priorities(product_ids: list[int]) -> dict[int, int]:
+    """
+    Pobiera z API IdoSell aktualne priorytety dla podanej listy ID produktów.
+    Zwraca słownik: {product_id: current_priority}
+    """
+    if not product_ids:
+        return {}
+
+    get_endpoint = IDOSELL_ENDPOINT.replace("/orders/orders/get", "/products/products/get")
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "X-API-KEY": IDOSELL_API_KEY,
+    }
+
+    payload = {
+        "params": {
+            "productsIds": product_ids
+        }
+    }
+
+    priorities_map = {}
+    try:
+        resp = _request_with_retry("POST", get_endpoint, payload, headers)
+        if resp.status_code == 200:
+            data = resp.json()
+            products = data.get("Results") or data.get("results") or []
+            for p in products:
+                pid = p.get("productId")
+                p_priority = p.get("productPriority", 1)
+                if pid:
+                    priorities_map[int(pid)] = int(p_priority)
+        else:
+            print(f"[IDOSELL-PRIORITY] Błąd pobierania obecnych priorytetów: HTTP {resp.status_code}", file=sys.stderr)
+    except Exception as e:
+        print(f"[IDOSELL-PRIORITY] Błąd połączenia podczas odczytu priorytetów: {e}", file=sys.stderr)
+
+    return priorities_map
+
+
 def sync_top100_priorities_to_idosell(report_label: str) -> None:
     """
     Pobiera Top 100 sprzedanych sztuk z ostatnich 7 dni, obniża priorytet do 1
     dla produktów wypadających z zestawienia oraz ustawia priorytet równy wolumenowi
-    sprzedaży (minimum 2) dla aktualnego Top 100 w IdoSell API v8.
+    sprzedaży (min. 2) dla aktualnego Top 100 w IdoSell.
+    Pomija produkty posiadające zarezerwowany priorytet (LOCKED_PRIORITY = 999).
     """
     if not DATABASE_URL or not IDOSELL_API_KEY:
         print("[IDOSELL-PRIORITY] Brak DATABASE_URL lub IDOSELL_API_KEY. Pomijam synchronizację.")
@@ -373,8 +417,6 @@ def sync_top100_priorities_to_idosell(report_label: str) -> None:
 
     # 2. Pobieramy aktualne Top 100 z ostatnich 7 dni
     top_100_current = get_sales_trends_from_db(report_label, days_back=7, limit=100)
-    
-    # Przeliczamy wolumen na priorytet (min. 2 dla towarów z Top 100)
     current_map = {
         str(pid): max(2, int(round(float(qty)))) 
         for (name, pid), qty in top_100_current 
@@ -382,24 +424,38 @@ def sync_top100_priorities_to_idosell(report_label: str) -> None:
     }
     current_pids = set(current_map.keys())
 
-    # 3. Towary wypadające z Top 100
+    # Towary wypadające z Top 100
     pids_to_reset = previous_pids - current_pids
 
-    print(f"[IDOSELL-PRIORITY] Nowe Top 100: {len(current_pids)} produktów | Do obniżenia priorytetu (-> 1): {len(pids_to_reset)} produktów.")
+    all_target_pids = [int(p) for p in (current_pids | pids_to_reset) if p.isdigit()]
+
+    # 3. Pobieramy aktualne priorytety z IdoSell, żeby sprawdzić ewentualne blokady 999
+    print(f"[IDOSELL-PRIORITY] Sprawdzanie obecnych priorytetów w panelu dla {len(all_target_pids)} produktów...")
+    existing_priorities = get_current_product_priorities(all_target_pids)
 
     products_payload = []
 
-    # A. Produkty wypadające z Top 100 – resetujemy priorytet do 1
+    # A. Produkty wypadające z Top 100 -> reset priorytetu do 1 (o ile nie mają 999)
     for pid in pids_to_reset:
+        pid_int = int(pid) if pid.isdigit() else pid
+        if existing_priorities.get(pid_int) == LOCKED_PRIORITY:
+            print(f"[IDOSELL-PRIORITY] Produkt {pid} ma priorytet {LOCKED_PRIORITY} (Ręczna blokada) – pomijam reset.")
+            continue
+            
         products_payload.append({
-            "productId": int(pid) if pid.isdigit() else pid,
+            "productId": pid_int,
             "productPriority": 1
         })
 
-    # B. Produkty z aktualnego Top 100 – priorytet = wolumen (min. 2)
+    # B. Produkty z aktualnego Top 100 -> priorytet = wolumen (min. 2, o ile nie mają 999)
     for pid, priority_val in current_map.items():
+        pid_int = int(pid) if pid.isdigit() else pid
+        if existing_priorities.get(pid_int) == LOCKED_PRIORITY:
+            print(f"[IDOSELL-PRIORITY] Produkt {pid} ma priorytet {LOCKED_PRIORITY} (Ręczna blokada) – pomijam automatyczną zmianę.")
+            continue
+
         products_payload.append({
-            "productId": int(pid) if pid.isdigit() else pid,
+            "productId": pid_int,
             "productPriority": priority_val
         })
 
@@ -420,7 +476,6 @@ def sync_top100_priorities_to_idosell(report_label: str) -> None:
     for batch in chunk_list(products_payload, 50):
         payload = {"params": {"products": batch}}
         try:
-            # Używamy metody PUT oraz dedykowanego endpointu v8 dla produktów
             resp = _request_with_retry("PUT", IDOSELL_PRODUCTS_ENDPOINT, payload, headers)
             if resp.status_code in (200, 207):
                 print(f"[IDOSELL-PRIORITY] Zaktualizowano priorytety dla paczki {len(batch)} produktów w IdoSell.")
