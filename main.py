@@ -20,6 +20,11 @@ IDOSELL_ENDPOINT = os.environ.get(
     "https://client5056.idosell.com/api/admin/v3/orders/orders/get"
 ).strip()
 
+IDOSELL_PRODUCTS_ENDPOINT = os.environ.get(
+    "IDOSELL_PRODUCTS_ENDPOINT",
+    "https://client5056.idosell.com/api/admin/v8/products/products"
+).strip()
+
 BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "").strip()
 MAIL_FROM = os.environ.get("MAIL_FROM", "").strip()
 MAIL_TO = os.environ.get("MAIL_TO", "").strip() 
@@ -67,10 +72,10 @@ def get_report_range(days_back: int = 1):
     return label, start_str, end_str
 
 
-def _post_with_retry(url: str, payload: dict, headers: dict, *, max_attempts: int = 5) -> requests.Response:
+def _request_with_retry(method: str, url: str, payload: dict, headers: dict, *, max_attempts: int = 5) -> requests.Response:
     for attempt in range(1, max_attempts + 1):
         try:
-            resp = requests.post(url, json=payload, headers=headers, timeout=HTTP_TIMEOUT)
+            resp = requests.request(method, url, json=payload, headers=headers, timeout=HTTP_TIMEOUT)
         except requests.RequestException as e:
             if attempt == max_attempts:
                 raise RuntimeError(f"Błąd sieci po {attempt} próbach: {e}") from e
@@ -89,12 +94,13 @@ def _post_with_retry(url: str, payload: dict, headers: dict, *, max_attempts: in
 
         return resp
 
-    raise RuntimeError("Nieoczekiwany błąd w _post_with_retry")
+    raise RuntimeError("Nieoczekiwany błąd w _request_with_retry")
 
 
 def fetch_orders_for_range(start_str: str, end_str: str) -> list[dict]:
     headers = {
-        "Content-Type": "application/json",
+        "accept": "application/json",
+        "content-type": "application/json",
         "X-API-KEY": IDOSELL_API_KEY,
     }
 
@@ -122,7 +128,7 @@ def fetch_orders_for_range(start_str: str, end_str: str) -> list[dict]:
 
         print(f"[IDOSELL] Pobieranie strony zamówień: {page}")
 
-        resp = _post_with_retry(IDOSELL_ENDPOINT, payload, headers)
+        resp = _request_with_retry("POST", IDOSELL_ENDPOINT, payload, headers)
 
         if resp.status_code == 207:
             print(f"[IDOSELL] Koniec wyników (HTTP 207): {resp.text}")
@@ -336,7 +342,7 @@ def sync_top100_priorities_to_idosell(report_label: str) -> None:
     """
     Pobiera Top 100 sprzedanych sztuk z ostatnich 7 dni, obniża priorytet do 1
     dla produktów wypadających z zestawienia oraz ustawia priorytet równy wolumenowi
-    sprzedaży (minimum 2) dla aktualnego Top 100 w IdoSell.
+    sprzedaży (minimum 2) dla aktualnego Top 100 w IdoSell API v8.
     """
     if not DATABASE_URL or not IDOSELL_API_KEY:
         print("[IDOSELL-PRIORITY] Brak DATABASE_URL lub IDOSELL_API_KEY. Pomijam synchronizację.")
@@ -405,16 +411,17 @@ def sync_top100_priorities_to_idosell(report_label: str) -> None:
         for i in range(0, len(lst), n):
             yield lst[i:i + n]
 
-    put_endpoint = IDOSELL_ENDPOINT.replace("/orders/orders/get", "/products/products/put")
     headers = {
-        "Content-Type": "application/json",
+        "accept": "application/json",
+        "content-type": "application/json",
         "X-API-KEY": IDOSELL_API_KEY,
     }
 
     for batch in chunk_list(products_payload, 50):
         payload = {"params": {"products": batch}}
         try:
-            resp = _post_with_retry(put_endpoint, payload, headers)
+            # Używamy metody PUT oraz dedykowanego endpointu v8 dla produktów
+            resp = _request_with_retry("PUT", IDOSELL_PRODUCTS_ENDPOINT, payload, headers)
             if resp.status_code in (200, 207):
                 print(f"[IDOSELL-PRIORITY] Zaktualizowano priorytety dla paczki {len(batch)} produktów w IdoSell.")
             else:
