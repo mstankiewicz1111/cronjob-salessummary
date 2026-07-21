@@ -7,7 +7,6 @@ from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 from collections import defaultdict
 
-# Importy do obsługi PostgreSQL (efektywny zapis zbiorczy)
 import psycopg2
 from psycopg2.extras import execute_values
 
@@ -76,7 +75,7 @@ def _post_with_retry(url: str, payload: dict, headers: dict, *, max_attempts: in
             if attempt == max_attempts:
                 raise RuntimeError(f"Błąd sieci po {attempt} próbach: {e}") from e
             sleep_s = (1.6 ** attempt) + random.random()
-            print(f"[IDOSELL] Błąd sieci: {e} | retry za {sleep_s:.1f}s (próba {attempt}/{max_attempts})")
+            print(f"[HTTP] Błąd sieci: {e} | retry za {sleep_s:.1f}s (próba {attempt}/{max_attempts})")
             time.sleep(sleep_s)
             continue
 
@@ -84,7 +83,7 @@ def _post_with_retry(url: str, payload: dict, headers: dict, *, max_attempts: in
             if attempt == max_attempts:
                 return resp
             sleep_s = (1.6 ** attempt) + random.random()
-            print(f"[IDOSELL] HTTP {resp.status_code} | retry za {sleep_s:.1f}s (próba {attempt}/{max_attempts})")
+            print(f"[HTTP] Status {resp.status_code} | retry za {sleep_s:.1f}s (próba {attempt}/{max_attempts})")
             time.sleep(sleep_s)
             continue
 
@@ -119,9 +118,9 @@ def fetch_orders_for_range(start_str: str, end_str: str) -> list[dict]:
     while True:
         page = payload["params"]["resultsPage"]
         if page >= MAX_PAGES:
-            raise RuntimeError(f"Osiągnięto MAX_PAGES={MAX_PAGES}. Coś nie tak z paginacją / filtrem.")
+            raise RuntimeError(f"Osiągnięto MAX_PAGES={MAX_PAGES}.")
 
-        print(f"[IDOSELL] Pobieranie strony: {page}")
+        print(f"[IDOSELL] Pobieranie strony zamówień: {page}")
 
         resp = _post_with_retry(IDOSELL_ENDPOINT, payload, headers)
 
@@ -135,14 +134,14 @@ def fetch_orders_for_range(start_str: str, end_str: str) -> list[dict]:
         try:
             data = resp.json()
         except ValueError as e:
-            raise RuntimeError(f"HTTP 200, ale odpowiedź nie jest JSON. Body (pierwsze 500): {resp.text[:500]}") from e
+            raise RuntimeError(f"HTTP 200, ale odpowiedź nie jest JSON.") from e
 
         orders = data.get("Results")
         if orders is None:
             orders = data.get("results", [])
 
         if not orders:
-            print(f"[IDOSELL] Koniec wyników na stronie {page} (pusta lista przy HTTP 200).")
+            print(f"[IDOSELL] Koniec wyników na stronie {page}.")
             break
 
         print(f"[IDOSELL] Zamówień na stronie {page}: {len(orders)}")
@@ -253,12 +252,8 @@ def aggregate_report(orders: list[dict]) -> dict:
 
 
 def save_sales_to_postgres(report_label: str, agg: dict) -> None:
-    """
-    Automatycznie tworzy nową wersję tabeli i zapisuje pełne 
-    dane sprzedażowe dnia (wraz z ID produktu) do bazy PostgreSQL.
-    """
     if not DATABASE_URL:
-        print("[POSTGRES] Brak zmiennej DATABASE_URL. Pomijam zapis do bazy.", file=sys.stderr)
+        print("[POSTGRES] Brak DATABASE_URL. Pomijam zapis do bazy.", file=sys.stderr)
         return
 
     create_table_sql = """
@@ -283,7 +278,7 @@ def save_sales_to_postgres(report_label: str, agg: dict) -> None:
         records.append((report_label, pid, name, "allegro", qty))
 
     if not records:
-        print("[POSTGRES] Brak danych o produktach do zapisania za ten dzień.")
+        print("[POSTGRES] Brak danych do zapisania za ten dzień.")
         return
 
     insert_sql = """
@@ -293,25 +288,19 @@ def save_sales_to_postgres(report_label: str, agg: dict) -> None:
         DO UPDATE SET quantity = EXCLUDED.quantity, product_name = EXCLUDED.product_name;
     """
 
-    print("[POSTGRES] Łączenie z bazą danych...")
     try:
         conn = psycopg2.connect(DATABASE_URL)
         with conn:
             with conn.cursor() as cur:
                 cur.execute(create_table_sql)
-                print(f"[POSTGRES] Zapisywanie {len(records)} rekordów do daily_sales_by_product...")
                 execute_values(cur, insert_sql, records)
         conn.close()
-        print("[POSTGRES] Sukces! Dane produktowe (z ID) zostały zapisane.")
+        print("[POSTGRES] Sukces! Dane produktowe zostały zapisane.")
     except Exception as e:
         print(f"[POSTGRES] BŁĄD ZAPISU DO BAZY: {e}", file=sys.stderr)
 
 
 def get_sales_trends_from_db(end_date_str: str, days_back: int, limit: int = 5) -> list:
-    """
-    Pobiera z bazy TOP N najlepiej sprzedających się produktów w oknie czasowym.
-    Zwraca strukturę: [((product_name, product_id), total_qty), ...]
-    """
     if not DATABASE_URL:
         return []
 
@@ -338,9 +327,115 @@ def get_sales_trends_from_db(end_date_str: str, days_back: int, limit: int = 5) 
                 trends = [((row[1], row[0]), fmt_qty(row[2])) for row in rows]
         conn.close()
     except Exception as e:
-        print(f"[POSTGRES] Błąd podczas pobierania trendów ({days_back} dni): {e}", file=sys.stderr)
+        print(f"[POSTGRES] Błąd pobierania trendów ({days_back} dni): {e}", file=sys.stderr)
     
     return trends
+
+
+def sync_top100_priorities_to_idosell(report_label: str) -> None:
+    """
+    Pobiera Top 100 sprzedanych sztuk z ostatnich 7 dni, obniża priorytet do 1
+    dla produktów wypadających z zestawienia oraz ustawia priorytet równy wolumenowi
+    sprzedaży (minimum 2) dla aktualnego Top 100 w IdoSell.
+    """
+    if not DATABASE_URL or not IDOSELL_API_KEY:
+        print("[IDOSELL-PRIORITY] Brak DATABASE_URL lub IDOSELL_API_KEY. Pomijam synchronizację.")
+        return
+
+    # 1. Odczytujemy poprzedni stan z PostgreSQL
+    init_tracker_sql = """
+    CREATE TABLE IF NOT EXISTS top100_priority_tracker (
+        product_id VARCHAR(50) PRIMARY KEY,
+        last_priority INT NOT NULL,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+    SELECT product_id FROM top100_priority_tracker;
+    """
+
+    previous_pids = set()
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(init_tracker_sql)
+                rows = cur.fetchall()
+                previous_pids = {str(r[0]) for r in rows}
+        conn.close()
+    except Exception as e:
+        print(f"[IDOSELL-PRIORITY] Błąd odczytu stanu z bazy: {e}", file=sys.stderr)
+        return
+
+    # 2. Pobieramy aktualne Top 100 z ostatnich 7 dni
+    top_100_current = get_sales_trends_from_db(report_label, days_back=7, limit=100)
+    
+    # Przeliczamy wolumen na priorytet (min. 2 dla towarów z Top 100)
+    current_map = {
+        str(pid): max(2, int(round(float(qty)))) 
+        for (name, pid), qty in top_100_current 
+        if pid and pid != "0"
+    }
+    current_pids = set(current_map.keys())
+
+    # 3. Towary wypadające z Top 100
+    pids_to_reset = previous_pids - current_pids
+
+    print(f"[IDOSELL-PRIORITY] Nowe Top 100: {len(current_pids)} produktów | Do obniżenia priorytetu (-> 1): {len(pids_to_reset)} produktów.")
+
+    products_payload = []
+
+    # A. Produkty wypadające z Top 100 – resetujemy priorytet do 1
+    for pid in pids_to_reset:
+        products_payload.append({
+            "productId": int(pid) if pid.isdigit() else pid,
+            "productPriority": 1
+        })
+
+    # B. Produkty z aktualnego Top 100 – priorytet = wolumen (min. 2)
+    for pid, priority_val in current_map.items():
+        products_payload.append({
+            "productId": int(pid) if pid.isdigit() else pid,
+            "productPriority": priority_val
+        })
+
+    if not products_payload:
+        print("[IDOSELL-PRIORITY] Brak zmian priorytetów do wysłania do IdoSell.")
+        return
+
+    def chunk_list(lst, n):
+        for i in range(0, len(lst), n):
+            yield lst[i:i + n]
+
+    put_endpoint = IDOSELL_ENDPOINT.replace("/orders/orders/get", "/products/products/put")
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-KEY": IDOSELL_API_KEY,
+    }
+
+    for batch in chunk_list(products_payload, 50):
+        payload = {"params": {"products": batch}}
+        try:
+            resp = _post_with_retry(put_endpoint, payload, headers)
+            if resp.status_code in (200, 207):
+                print(f"[IDOSELL-PRIORITY] Zaktualizowano priorytety dla paczki {len(batch)} produktów w IdoSell.")
+            else:
+                print(f"[IDOSELL-PRIORITY] Błąd edycji w IdoSell: HTTP {resp.status_code} - {resp.text}", file=sys.stderr)
+        except Exception as e:
+            print(f"[IDOSELL-PRIORITY] Błąd połączenia przy aktualizacji priorytetów: {e}", file=sys.stderr)
+
+    # 4. Zapisujemy nowy stan w PostgreSQL
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("TRUNCATE TABLE top100_priority_tracker;")
+                if current_map:
+                    insert_tracker = "INSERT INTO top100_priority_tracker (product_id, last_priority) VALUES %s;"
+                    records = [(pid, val) for pid, val in current_map.items()]
+                    execute_values(cur, insert_tracker, records)
+        conn.close()
+        print("[IDOSELL-PRIORITY] Stan w PostgreSQL został zaktualizowany.")
+    except Exception as e:
+        print(f"[IDOSELL-PRIORITY] Błąd zapisu stanu w bazie: {e}", file=sys.stderr)
 
 
 def render_table(rows: list) -> str:
@@ -349,7 +444,6 @@ def render_table(rows: list) -> str:
 
     body = ""
     for i, ((name, pid), qty) in enumerate(rows, start=1):
-        # MODYFIKACJA: Dodanie hiperłącza do ID i nazwy produktu
         if pid and pid != "0":
             product_url = f"https://wassyl.pl/product-pol-{pid}"
             display_name = f"<a href='{product_url}' style='color:#0288d1; text-decoration:underline; font-weight:500;'>{name}</a> <span style='color:#888; font-size:12px; white-space:nowrap;'>| ID {pid}</span>"
@@ -392,7 +486,6 @@ def build_email_html(report_label: str, agg: dict, trends_3d: list, trends_7d: l
         
         table_rows = ""
         for i, ((name, pid), qty) in enumerate(trends, start=1):
-            # MODYFIKACJA: Dodanie hiperłącza do trendów produktowych
             if pid and pid != "0":
                 product_url = f"https://wassyl.pl/product-pol-{pid}"
                 display_name = f"<a href='{product_url}' style='color:#026aa7; text-decoration:underline; font-weight:500;'>{name}</a> <span style='color:#888; font-size:11px; white-space:nowrap;'>| ID {pid}</span>"
@@ -515,8 +608,6 @@ def main():
     require_env("BREVO_API_KEY", BREVO_API_KEY)
     require_env("MAIL_FROM", MAIL_FROM)
     require_env("MAIL_TO", MAIL_TO)
-    if not DATABASE_URL:
-        print("[OSTRZEŻENIE] Brak zmiennej DATABASE_URL. Dane nie będą analizowane.", file=sys.stderr)
 
     report_label, start_str, end_str = get_report_range(days_back=1)
     print(f"[RANGE] {start_str} -> {end_str}")
@@ -524,9 +615,15 @@ def main():
     orders = fetch_orders_for_range(start_str, end_str)
     agg = aggregate_report(orders)
 
+    # 1. Zapis bieżącej sprzedaży do bazy PostgreSQL
     save_sales_to_postgres(report_label, agg)
 
-    print("[POSTGRES] Pobieranie trendów produktowych...")
+    # 2. Synchronizacja priorytetów towarów w IdoSell na podstawie Top 100 z 7 dni
+    print("[IDOSELL-PRIORITY] Rozpoczynam synchronizację priorytetów do IdoSell...")
+    sync_top100_priorities_to_idosell(report_label)
+
+    # 3. Pobranie trendów i wysyłka maila
+    print("[POSTGRES] Pobieranie trendów produktowych do maila...")
     trends_3d = get_sales_trends_from_db(report_label, days_back=3, limit=5)
     trends_7d = get_sales_trends_from_db(report_label, days_back=7, limit=5)
 
