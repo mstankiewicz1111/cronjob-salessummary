@@ -241,6 +241,12 @@ def aggregate_report(orders: list[dict]) -> dict:
             else:
                 product_qty_sklep[(product_name, product_id)] += qty
 
+    total_orders = len(daily_order_ids)
+    total_items_sold = sum(product_qty_sklep.values()) + sum(product_qty_allegro.values())
+
+    avg_order_value = (total_revenue / total_orders) if total_orders > 0 else 0.0
+    avg_items_per_order = (total_items_sold / total_orders) if total_orders > 0 else 0.0
+
     currency_note = ""
     if len(currencies_seen) > 1:
         currency_note = f" (uwaga: wiele walut: {', '.join(sorted(currencies_seen))})"
@@ -252,7 +258,10 @@ def aggregate_report(orders: list[dict]) -> dict:
         "currency_note": currency_note,
         "orders_sklep_count": len(orders_sklep_ids),
         "orders_allegro_count": len(orders_allegro_ids),
-        "orders_total_count": len(daily_order_ids),
+        "orders_total_count": total_orders,
+        "total_items_sold": fmt_qty(round(total_items_sold, 2)),
+        "avg_order_value": round(avg_order_value, 2),
+        "avg_items_per_order": round(avg_items_per_order, 2),
         "top_sklep": top_n_products(product_qty_sklep, TOP_N),
         "top_allegro": top_n_products(product_qty_allegro, TOP_N),
         "raw_sklep": product_qty_sklep,
@@ -581,11 +590,23 @@ def build_email_html(report_label: str, agg: dict, trends_3d: list, trends_7d: l
             <td style="padding: 4px 0; color: #555;">Zamówienia (Allegro):</td>
             <td style="padding: 4px 0; text-align: right; font-weight: bold; color: #111;">{agg['orders_allegro_count']}</td>
           </tr>
+          <tr>
+            <td style="padding: 4px 0; color: #555;">Łączna liczba zamówień:</td>
+            <td style="padding: 4px 0; text-align: right; font-weight: bold; color: #111;">{agg['orders_total_count']}</td>
+          </tr>
           <tr style="border-bottom: 1px solid #f0f0f0;">
-            <td style="padding: 4px 0 10px 0; color: #555;">Łączna liczba zamówień:</td>
-            <td style="padding: 4px 0 10px 0; text-align: right; font-weight: bold; color: #111;">{agg['orders_total_count']}</td>
+            <td style="padding: 4px 0 10px 0; color: #555;">Sprzedane towary (łącznie):</td>
+            <td style="padding: 4px 0 10px 0; text-align: right; font-weight: bold; color: #111;">{agg['total_items_sold']} szt.</td>
           </tr>
           <tr>
+            <td style="padding: 10px 0 4px 0; color: #555;">Średnia wartość koszyka:</td>
+            <td style="padding: 10px 0 4px 0; text-align: right; font-weight: bold; color: #111;">{fmt_money_pln(agg['avg_order_value'])}</td>
+          </tr>
+          <tr>
+            <td style="padding: 4px 0 10px 0; color: #555;">Średnio produktów w koszyku:</td>
+            <td style="padding: 4px 0 10px 0; text-align: right; font-weight: bold; color: #111;">{agg['avg_items_per_order']:.2f} szt.</td>
+          </tr>
+          <tr style="border-top: 1px solid #f0f0f0;">
             <td style="padding: 10px 0 4px 0; color: #111; font-weight: 600;">Łączna wartość (brutto):</td>
             <td style="padding: 10px 0 4px 0; text-align: right; font-weight: bold; color: #d32f2f; font-size: 16px;">{total_value_str}</td>
           </tr>
