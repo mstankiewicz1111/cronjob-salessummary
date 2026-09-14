@@ -45,6 +45,11 @@ TOP_N = int(os.environ.get("TOP_N", "10"))
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "2000"))
 HTTP_TIMEOUT = (10, 60)
 
+# =========================
+# Nowa zmienna dla nowości
+# =========================
+NEW_PRODUCT_MIN_ID = int(os.environ.get("NEW_PRODUCT_MIN_ID", "17219"))
+
 
 def require_env(name: str, value: str) -> None:
     if not value:
@@ -211,6 +216,10 @@ def aggregate_report(orders: list[dict]) -> dict:
     currencies_seen = set()
     revenue_counted_for = set()
 
+    # Nowe liczniki dla nowości i promocji
+    promo_items_sold = 0.0
+    new_items_sold = 0.0
+
     for order in orders:
         order_id = order.get("orderId")
         if order_id:
@@ -241,6 +250,13 @@ def aggregate_report(orders: list[dict]) -> dict:
             else:
                 product_qty_sklep[(product_name, product_id)] += qty
 
+            # Zliczanie promocji i nowości
+            if "k01" in product_name.lower():
+                promo_items_sold += qty
+            
+            if product_id.isdigit() and int(product_id) >= NEW_PRODUCT_MIN_ID:
+                new_items_sold += qty
+
     total_orders = len(daily_order_ids)
     total_items_sold = sum(product_qty_sklep.values()) + sum(product_qty_allegro.values())
 
@@ -260,6 +276,8 @@ def aggregate_report(orders: list[dict]) -> dict:
         "orders_allegro_count": len(orders_allegro_ids),
         "orders_total_count": total_orders,
         "total_items_sold": fmt_qty(round(total_items_sold, 2)),
+        "promo_items_sold": fmt_qty(round(promo_items_sold, 2)),
+        "new_items_sold": fmt_qty(round(new_items_sold, 2)),
         "avg_order_value": round(avg_order_value, 2),
         "avg_items_per_order": round(avg_items_per_order, 2),
         "top_sklep": top_n_products(product_qty_sklep, TOP_N),
@@ -594,9 +612,17 @@ def build_email_html(report_label: str, agg: dict, trends_3d: list, trends_7d: l
             <td style="padding: 4px 0; color: #555;">Łączna liczba zamówień:</td>
             <td style="padding: 4px 0; text-align: right; font-weight: bold; color: #111;">{agg['orders_total_count']}</td>
           </tr>
+          <tr>
+            <td style="padding: 4px 0; color: #555;">Sprzedane towary (łącznie):</td>
+            <td style="padding: 4px 0; text-align: right; font-weight: bold; color: #111;">{agg['total_items_sold']} szt.</td>
+          </tr>
+          <tr>
+            <td style="padding: 4px 0; color: #555;">W tym towary z promocji (k01):</td>
+            <td style="padding: 4px 0; text-align: right; font-weight: bold; color: #111;">{agg['promo_items_sold']} szt.</td>
+          </tr>
           <tr style="border-bottom: 1px solid #f0f0f0;">
-            <td style="padding: 4px 0 10px 0; color: #555;">Sprzedane towary (łącznie):</td>
-            <td style="padding: 4px 0 10px 0; text-align: right; font-weight: bold; color: #111;">{agg['total_items_sold']} szt.</td>
+            <td style="padding: 4px 0 10px 0; color: #555;">W tym nowości:</td>
+            <td style="padding: 4px 0 10px 0; text-align: right; font-weight: bold; color: #111;">{agg['new_items_sold']} szt.</td>
           </tr>
           <tr>
             <td style="padding: 10px 0 4px 0; color: #555;">Średnia wartość koszyka:</td>
@@ -627,9 +653,6 @@ def build_email_html(report_label: str, agg: dict, trends_3d: list, trends_7d: l
 
       <h3 style="margin-top: 0; margin-bottom: 4px; font-size: 15px; color: #111111; font-weight: 600;">🛒 Top {TOP_N} dnia — Sklep</h3>
       {render_table(agg['top_sklep'])}
-
-      <h3 style="margin-top: 10px; margin-bottom: 4px; font-size: 15px; color: #111111; font-weight: 600;">🦅 Top {TOP_N} dnia — Allegro</h3>
-      {render_table(agg['top_allegro'])}
 
       <p style="margin-top: 30px; font-size: 11px; color: #999999; text-align: center; border-top: 1px solid #edeef0; padding-top: 12px;">
         Raport wygenerowany automatycznie przez system analityczny.<br>
