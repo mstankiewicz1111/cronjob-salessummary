@@ -211,6 +211,7 @@ def aggregate_report(orders: list[dict]) -> dict:
 
     product_qty_sklep = defaultdict(float)
     product_qty_allegro = defaultdict(float)
+    product_qty_new = defaultdict(float)  # <-- NOWE: Słownik do zliczania nowości
 
     total_revenue = 0.0
     currencies_seen = set()
@@ -250,12 +251,14 @@ def aggregate_report(orders: list[dict]) -> dict:
             else:
                 product_qty_sklep[(product_name, product_id)] += qty
 
-            # Zliczanie promocji i nowości
+            # Zliczanie promocji
             if "k01" in product_name.lower():
                 promo_items_sold += qty
             
+            # Zliczanie nowości i dodawanie do słownika Nowości
             if product_id.isdigit() and int(product_id) >= NEW_PRODUCT_MIN_ID:
                 new_items_sold += qty
+                product_qty_new[(product_name, product_id)] += qty  # <-- NOWE: Zliczanie sztuk danego produktu
 
     total_orders = len(daily_order_ids)
     total_items_sold = sum(product_qty_sklep.values()) + sum(product_qty_allegro.values())
@@ -282,6 +285,7 @@ def aggregate_report(orders: list[dict]) -> dict:
         "avg_items_per_order": round(avg_items_per_order, 2),
         "top_sklep": top_n_products(product_qty_sklep, TOP_N),
         "top_allegro": top_n_products(product_qty_allegro, TOP_N),
+        "top_new": top_n_products(product_qty_new, 10),  # <-- NOWE: Wyciągnięcie top 10 z nowości
         "raw_sklep": product_qty_sklep,
         "raw_allegro": product_qty_allegro
     }
@@ -653,6 +657,10 @@ def build_email_html(report_label: str, agg: dict, trends_3d: list, trends_7d: l
 
       <h3 style="margin-top: 0; margin-bottom: 4px; font-size: 15px; color: #111111; font-weight: 600;">🛒 Top {TOP_N} dnia — Sklep</h3>
       {render_table(agg['top_sklep'])}
+
+      <!-- SEKCJA DLA NOWOŚCI -->
+      <h3 style="margin-top: 20px; margin-bottom: 4px; font-size: 15px; color: #111111; font-weight: 600;">✨ Top 10 Nowości</h3>
+      {render_table(agg['top_new'])}
 
       <p style="margin-top: 30px; font-size: 11px; color: #999999; text-align: center; border-top: 1px solid #edeef0; padding-top: 12px;">
         Raport wygenerowany automatycznie przez system analityczny.<br>
